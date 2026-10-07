@@ -1,0 +1,1209 @@
+#!/usr/bin/env python3
+"""hist — search every local AI agent session (Claude Code, Claude desktop/Cowork, Codex, Cursor).
+
+Start here:   hist help            (this text)      hist <command> --help   (flags + examples)
+Humans:       hist                 (TUI)
+Agents:       always pass --json; stdout is JSON, progress/notes go to stderr.
+
+Commands:
+  search      find sessions by text/regex, directory, message time, source
+  show        print one transcript (paginate with --range / --tail, trim with --max-chars)
+  dirs        list working directories that have sessions (discover values for --dir)
+  sources     what is indexed per client
+  annotate    attach your own title/summary/tags to a session (persists across re-index)
+  summarize   LLM-fill missing titles/summaries on demand (default: claude -p --model haiku)
+  index       refresh the index now (search/show/dirs already refresh incrementally, ~0.2s)
+
+Typical agent flow:
+  hist dirs --json                                              # which roots exist
+  hist search -d ~/src/app -q "rate limit" --since 7d --json    # candidate sessions + matching snippets
+  hist show <id> --grep "rate limit" --json                     # just the relevant messages
+  hist show <id> --range 40:80 --max-chars 2000 --json          # read around them
+
+Exit codes: 0 ok (an empty result is still 0)  2 invalid arguments  3 session not found/ambiguous  1 internal error
+Errors with --json: {"error": "...", "hint": "...", "code": N} on stdout.
+Env: HIST_DB (index path, default ~/.cache/agent-history/index.db), HIST_AGENT (default --by), HIST_SUMMARIZER.
+"""
+import argparse, curses, datetime as dt, glob, json, os, re, sqlite3, sys, textwrap, time
+
+HOME = os.path.expanduser("~")
+DB_PATH = os.environ.get("HIST_DB", os.path.join(HOME, ".cache", "agent-history", "index.db"))
+CLAUDE_DESKTOP = os.path.join(HOME, "Library/Application Support/Claude")
+CURSOR_DB = os.path.join(HOME, "Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+TEXT_CAP, TOOL_CAP = 20000, 2000
+SCHEMA_VERSION = "4"
+
+# ---------------------------------------------------------------- storage
+
+def connect():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db = sqlite3.connect(DB_PATH)
+    db.execute("pragma journal_mode=wal")
+    db.execute("pragma synchronous=normal")
+    db.execute("create table if not exists meta(k text primary key, v text)")
+    v = db.execute("select v from meta where k='schema'").fetchone()
+    if not v or v[0] != SCHEMA_VERSION:  # derived tables only; annotations are user data and survive
+        db.executescript("drop table if exists files; drop table if exists sessions; drop table if exists messages;")
+        db.execute("insert or replace into meta values('schema',?)", (SCHEMA_VERSION,))
+    db.executescript("""
+    create table if not exists files(path text primary key, mtime real, size int);
+    create table if not exists sessions(
+        id text primary key, source text, native_id text, path text, cwd text, title text,
+        started text, updated text, branch text, n_msgs int, parent text,
+        native_summary text, first_prompt text, last_prompt text);
+    create table if not exists annotations(
+        id text primary key, title text, summary text, tags text, by text, updated text);
+    create table if not exists messages(
+        session text, seq int, ts text, role text, text text);
+    create index if not exists m_session on messages(session, seq);
+    create index if not exists m_ts on messages(ts);
+    create index if not exists s_cwd on sessions(cwd);
+    """)
+    db.commit()
+    db.create_function("regexp", 2, _regexp, deterministic=True)
+    return db
+
+_re_cache = {}
+def _regexp(pattern, s):
+    if s is None:
+        return 0
+    r = _re_cache.get(pattern)
+    if r is None:
+        r = _re_cache[pattern] = re.compile(pattern)
+    return 1 if r.search(s) else 0
+
+def iso(ts):
+    """Normalize epoch-ms / epoch-s / ISO strings to UTC 'YYYY-MM-DDTHH:MM:SS.mmmZ'."""
+    if ts is None or ts == "":
+        return None
+    if isinstance(ts, (int, float)):
+        if ts > 1e11:
+            ts = ts / 1000.0
+        return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    s = str(ts)
+    if s.isdigit():
+        return iso(int(s))
+    try:
+        d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    except ValueError:
+        return s
+
+def cap(s, n):
+    s = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False)
+    return s if len(s) <= n else s[:n] + f" …[+{len(s) - n} chars]"
+
+INJECTED = re.compile(r"^\s*(<environment_context>|<user_instructions>|<permissions|<model_switch>|# AGENTS\.md|<INSTRUCTIONS>|<turn_aborted>"
+                      r"|<local-command|<command-name>|<system-reminder>|<task-notification>|Caveat: |\[Request interrupted)")
+
+LEADING_TAG = re.compile(r"^\s*<([\w:-]+)[^>]*>.*?</\1>\s*", re.S)
+
+def human_text(t):
+    """The part of a user message the human typed: drop client-injected <tag>…</tag> preambles and meta lines."""
+    prev = None
+    while prev != t:
+        prev, t = t, LEADING_TAG.sub("", t, count=1)
+    return "" if INJECTED.match(t) else t.strip()
+
+SUMMARY_MARKER = "You are labeling a past AI coding-assistant session"  # hist summarize's own runs
+
+class Session:
+    def __init__(self, sid, source, native_id, path):
+        self.id, self.source, self.native_id, self.path = sid, source, native_id, path
+        self.cwd = self.title = self.branch = self.parent = self.native_summary = None
+        self.msgs = []  # (ts, role, text)
+
+    def add(self, ts, role, text):
+        if text and text.strip():
+            self.msgs.append((iso(ts), role, text))
+
+    def save(self, db):
+        db.execute("delete from messages where session=?", (self.id,))
+        db.execute("delete from sessions where id=?", (self.id,))
+        if not self.msgs or any(r == "user" and t.startswith(SUMMARY_MARKER) for _, r, t in self.msgs[:3]):
+            return
+        tss = [m[0] for m in self.msgs if m[0]]
+        prompts = [p for p in (human_text(t) for _, r, t in self.msgs if r == "user") if p]
+        substantive = [p for p in prompts if len(p) >= 20]
+        clean = lambda t: re.sub(r"\s+", " ", t).strip()[:1000] if t else None
+        db.execute("insert into sessions values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            self.id, self.source, self.native_id, self.path, self.cwd, self.title,
+            min(tss) if tss else None, max(tss) if tss else None, self.branch, len(self.msgs), self.parent,
+            self.native_summary, clean((substantive or prompts or [None])[0]), clean(prompts[-1] if prompts else None)))
+        db.executemany("insert into messages values(?,?,?,?,?)",
+                       [(self.id, i, ts, role, text) for i, (ts, role, text) in enumerate(self.msgs)])
+
+# ---------------------------------------------------------------- Claude Code (CLI, desktop Code tab, Cowork)
+
+def claude_desktop_titles():
+    """cliSessionId -> title from Claude desktop's per-session metadata files."""
+    out = {}
+    for f in glob.glob(os.path.join(CLAUDE_DESKTOP, "*-sessions", "*", "*", "local_*.json")):
+        try:
+            d = json.load(open(f))
+            if d.get("cliSessionId") and d.get("title"):
+                out[d["cliSessionId"]] = (d["title"], d.get("cwd"))
+        except Exception:
+            pass
+    return out
+
+def claude_files():
+    for f in glob.glob(os.path.join(HOME, ".claude/projects/**/*.jsonl"), recursive=True):
+        yield f, "claude"
+    for f in glob.glob(os.path.join(CLAUDE_DESKTOP, "local-agent-mode-sessions/**/.claude/projects/**/*.jsonl"), recursive=True):
+        yield f, "claude-desktop"
+
+def blocks_text(content, role):
+    """Yield (role, text) from a Claude message content (str or list of blocks)."""
+    if isinstance(content, str):
+        yield role, content
+        return
+    for b in content or []:
+        t = b.get("type")
+        if t == "text":
+            yield role, b.get("text", "")
+        elif t == "tool_use":
+            yield "tool", f"[tool_use {b.get('name')}] " + cap(b.get("input"), TOOL_CAP)
+        elif t == "tool_result":
+            c = b.get("content")
+            if isinstance(c, list):
+                c = "\n".join(x.get("text", "") for x in c if isinstance(x, dict))
+            yield "tool", "[tool_result] " + cap(c or "", TOOL_CAP)
+
+def parse_claude(path, source, titles):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    s = Session(f"{source}:{stem}", source, stem, path)
+    if "/subagents/" in path:
+        s.parent = path.split("/subagents/")[0].rsplit("/", 1)[-1]
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            t = r.get("type")
+            if t == "ai-title" and not s.title:
+                s.title = r.get("aiTitle")
+            elif t == "custom-title":
+                s.title = r.get("customTitle")
+            elif t == "summary":
+                s.native_summary = r.get("summary")
+            if t not in ("user", "assistant"):
+                continue
+            s.cwd = s.cwd or r.get("cwd")
+            s.branch = s.branch or r.get("gitBranch")
+            msg = r.get("message") or {}
+            if r.get("isCompactSummary"):
+                c = msg.get("content")
+                s.native_summary = cap(c if isinstance(c, str) else "".join(b.get("text", "") for b in c or []), 1500)
+                continue
+            if r.get("isMeta"):
+                continue
+            for role, text in blocks_text(msg.get("content"), msg.get("role") or t):
+                s.add(r.get("timestamp"), role, text if role == "tool" else cap(text, TEXT_CAP))
+    if s.native_id in titles:
+        s.title = titles[s.native_id][0]
+        if source == "claude-desktop":
+            s.cwd = titles[s.native_id][1] or s.cwd
+    return s
+
+# ---------------------------------------------------------------- Codex (CLI, desktop/ChatGPT app, IDE ext)
+
+def codex_titles():
+    out = {}
+    try:
+        db = sqlite3.connect(f"file:{HOME}/.codex/state_5.sqlite?immutable=1", uri=True)
+        for tid, title, name, branch in db.execute("select id, title, name, git_branch from threads"):
+            out[tid] = (name or title, branch)
+    except Exception:
+        pass
+    try:
+        for line in open(os.path.join(HOME, ".codex/session_index.jsonl")):
+            r = json.loads(line)
+            if r.get("thread_name"):
+                out.setdefault(r["id"], (r["thread_name"], None))
+    except Exception:
+        pass
+    return out
+
+def codex_files():
+    for d in ("sessions", "archived_sessions"):
+        for f in glob.glob(os.path.join(HOME, ".codex", d, "**/*.jsonl"), recursive=True):
+            yield f, "codex"
+
+def parse_codex(path, source, titles):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", stem)
+    s = Session(f"codex:{m.group(1) if m else stem}", source, m.group(1) if m else stem, path)
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if '"session_meta"' in line[:120]:
+                p = json.loads(line).get("payload", {})
+                s.cwd = s.cwd or p.get("cwd")
+                s.native_id = p.get("id") or s.native_id
+                s.parent = p.get("parent_thread_id")
+                if p.get("agent_nickname"):
+                    s.title = s.title or f"[subagent {p['agent_nickname']}]"
+                continue
+            if '"type":"turn_context"' in line[:120]:
+                p = json.loads(line).get("payload", {})
+                s.cwd = s.cwd or p.get("cwd")
+                continue
+            if '"response_item"' not in line[:120]:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            p, ts = r.get("payload", {}), r.get("timestamp")
+            t = p.get("type")
+            if t == "message" and p.get("role") in ("user", "assistant"):
+                text = "\n".join(c.get("text", "") for c in p.get("content") or [] if isinstance(c, dict))
+                if p["role"] == "user" and INJECTED.match(text):
+                    continue
+                s.add(ts, p["role"], cap(text, TEXT_CAP))
+            elif t in ("function_call", "custom_tool_call", "local_shell_call"):
+                s.add(ts, "tool", f"[tool_use {p.get('name', t)}] " + cap(p.get("arguments") or p.get("input") or p.get("action"), TOOL_CAP))
+            elif t in ("function_call_output", "custom_tool_call_output"):
+                out = p.get("output")
+                if isinstance(out, dict):
+                    out = out.get("content") or out
+                s.add(ts, "tool", "[tool_result] " + cap(out or "", TOOL_CAP))
+    t = titles.get(s.native_id)
+    if t:
+        s.title = t[0] or s.title
+        s.branch = t[1]
+    return s
+
+# ---------------------------------------------------------------- Cursor (IDE agent/chat, background agents, CLI transcripts)
+
+def cursor_workspace_paths():
+    out = {}
+    for f in glob.glob(os.path.join(HOME, "Library/Application Support/Cursor/User/workspaceStorage/*/workspace.json")):
+        try:
+            d = json.load(open(f))
+            u = d.get("folder") or d.get("workspace") or ""
+            out[os.path.basename(os.path.dirname(f))] = re.sub(r"^file://", "", u).replace("%20", " ")
+        except Exception:
+            pass
+    return out
+
+def bubble_text(b):
+    parts = []
+    if b.get("text"):
+        parts.append(("user" if b.get("type") == 1 else "assistant", b["text"]))
+    tf = b.get("toolFormerData")
+    if isinstance(tf, dict) and tf.get("name"):
+        parts.append(("tool", f"[tool_use {tf.get('name')}] " + cap(tf.get("rawArgs") or tf.get("params") or "", TOOL_CAP)))
+        if tf.get("result"):
+            parts.append(("tool", "[tool_result] " + cap(tf["result"], TOOL_CAP)))
+    return parts
+
+def index_cursor(db, full, log):
+    seen = set()
+    if os.path.exists(CURSOR_DB):
+        src = sqlite3.connect(f"file:{CURSOR_DB}?mode=ro", uri=True)
+        src.text_factory = lambda b: b.decode("utf-8", "replace")
+        ws = cursor_workspace_paths()
+        headers = {}
+        try:
+            for cid, wid, upd, sub in src.execute("select composerId, workspaceId, lastUpdatedAt, isSubagent from composerHeaders"):
+                headers[cid] = (wid, upd, sub)
+        except sqlite3.Error:
+            pass
+        n = 0
+        for key, val in src.execute("select key, value from cursorDiskKV where key like 'composerData:%'"):
+            try:
+                c = json.loads(val)
+            except ValueError:
+                continue
+            cid = c.get("composerId") or key.split(":", 1)[1]
+            seen.add(cid)
+            stamp = str(c.get("lastUpdatedAt") or c.get("createdAt"))
+            fkey = f"cursor-composer:{cid}"
+            row = db.execute("select mtime from files where path=?", (fkey,)).fetchone()
+            if row and not full and str(row[0]) in (stamp, stamp + ".0"):
+                continue
+            s = Session(f"cursor:{cid}", "cursor", cid, CURSOR_DB)
+            s.title = c.get("name")
+            if c.get("subtitle") and c.get("subtitle") != "New chat":
+                s.native_summary = c["subtitle"]
+            wsi = c.get("workspaceIdentifier") or {}
+            s.cwd = (wsi.get("uri") or {}).get("fsPath") or ws.get(wsi.get("id") or (headers.get(cid) or [None])[0])
+            bubbles = {}
+            for bk, bv in src.execute("select key, value from cursorDiskKV where key >= ? and key < ?",
+                                      (f"bubbleId:{cid}:", f"bubbleId:{cid};")):
+                try:
+                    bubbles[bk.rsplit(":", 1)[1]] = json.loads(bv)
+                except ValueError:
+                    pass
+            order = [h.get("bubbleId") for h in c.get("fullConversationHeadersOnly") or []] or \
+                    sorted(bubbles, key=lambda k: bubbles[k].get("createdAt") or "")
+            hdr_ts = {h.get("bubbleId"): h.get("createdAt") for h in c.get("fullConversationHeadersOnly") or []}
+            for bid in order:
+                b = bubbles.get(bid)
+                if not b:
+                    continue
+                ts = b.get("createdAt") or hdr_ts.get(bid) or b.get("startedAtMs")
+                for role, text in bubble_text(b):
+                    s.add(ts, role, text if role == "tool" else cap(text, TEXT_CAP))
+            if not s.msgs and c.get("text"):
+                s.add(c.get("createdAt"), "user", c["text"])  # draft / unsent
+            s.save(db)
+            db.execute("insert or replace into files values(?,?,?)", (fkey, stamp, 0))
+            n += 1
+        if n:
+            log(f"cursor: {n} composers updated")
+    # Cursor agent transcripts (CLI agent + IDE agents whose composer DB rows were cleaned up)
+    for f in glob.glob(os.path.join(HOME, ".cursor/projects/*/agent-transcripts/**/*.jsonl"), recursive=True):
+        cid = os.path.splitext(os.path.basename(f))[0]
+        if cid in seen:
+            continue
+        if not changed(db, f, full):
+            continue
+        s = Session(f"cursor:{cid}", "cursor", cid, f)
+        proj = f.split("/.cursor/projects/")[1].split("/")[0]
+        s.cwd = guess_path(proj)
+        mtime = os.path.getmtime(f)
+        last_ts = None
+        for line in open(f, errors="replace"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            role = r.get("role")
+            content = (r.get("message") or {}).get("content")
+            for b in content if isinstance(content, list) else [{"type": "text", "text": content or ""}]:
+                if b.get("type") == "text":
+                    text = b.get("text", "")
+                    m = re.search(r"<timestamp>(.*?)</timestamp>", text)
+                    if m:
+                        last_ts = parse_cursor_ts(m.group(1)) or last_ts
+                    text = re.sub(r"</?user_query>|<timestamp>.*?</timestamp>\n?", "", text).strip()
+                    s.add(last_ts or mtime, role, cap(text, TEXT_CAP))
+                elif b.get("type") == "tool_use":
+                    s.add(last_ts or mtime, "tool", f"[tool_use {b.get('name')}] " + cap(b.get("input"), TOOL_CAP))
+        s.save(db)
+        mark(db, f)
+
+def parse_cursor_ts(s):
+    m = re.match(r"\w+, (\w+ \d+, \d{4}), (\d+:\d+ [AP]M) \(UTC([+-]\d+)(?::?(\d+))?\)", s.strip())
+    if not m:
+        return None
+    try:
+        d = dt.datetime.strptime(f"{m.group(1)} {m.group(2)}", "%b %d, %Y %I:%M %p")
+        off = dt.timedelta(hours=int(m.group(3)), minutes=int(m.group(4) or 0) * (1 if int(m.group(3)) >= 0 else -1))
+        return iso((d - off).replace(tzinfo=dt.timezone.utc).isoformat())
+    except ValueError:
+        return None
+
+def guess_path(slug):
+    """Cursor encodes '/Users/a/b-c' as 'Users-a-b-c'; resolve greedily against the filesystem."""
+    parts, cur = slug.split("-"), "/"
+    i = 0
+    while i < len(parts):
+        for j in range(len(parts), i, -1):
+            cand = os.path.join(cur, "-".join(parts[i:j]))
+            if os.path.exists(cand):
+                cur, i = cand, j
+                break
+        else:
+            return os.path.join(cur, "-".join(parts[i:]))
+    return cur
+
+# ---------------------------------------------------------------- indexing driver
+
+def changed(db, path, full):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    row = db.execute("select mtime, size from files where path=?", (path,)).fetchone()
+    return full or not row or row[0] != st.st_mtime or row[1] != st.st_size
+
+def mark(db, path):
+    st = os.stat(path)
+    db.execute("insert or replace into files values(?,?,?)", (path, st.st_mtime, st.st_size))
+
+def index(db, full=False, quiet=False):
+    log = (lambda m: None) if quiet else (lambda m: print(m, file=sys.stderr))
+    t0 = time.time()
+    ctitles, xtitles = claude_desktop_titles(), codex_titles()
+    jobs = [(f, src, parse_claude, ctitles) for f, src in claude_files()] + \
+           [(f, src, parse_codex, xtitles) for f, src in codex_files()]
+    todo = [j for j in jobs if changed(db, j[0], full)]
+    for i, (f, src, parser, titles) in enumerate(todo):
+        if not quiet and sys.stderr.isatty():
+            print(f"\rindexing {i + 1}/{len(todo)} {src:<14}", end="", file=sys.stderr)
+        try:
+            parser(f, src, titles).save(db)
+            mark(db, f)
+        except Exception as e:  # one bad file must not kill the index
+            log(f"\nskip {f}: {e}")
+        if i % 50 == 0:
+            db.commit()
+    if todo and not quiet and sys.stderr.isatty():
+        print(file=sys.stderr)
+    if todo:
+        log(f"files: {len(todo)} updated")
+    index_cursor(db, full, log)
+    # drop sessions whose files disappeared
+    live = {j[0] for j in jobs}
+    for (p,) in db.execute("select path from files where path like '/%'").fetchall():
+        if p not in live and not os.path.exists(p):
+            db.execute("delete from messages where session in (select id from sessions where path=?)", (p,))
+            db.execute("delete from sessions where path=?", (p,))
+            db.execute("delete from files where path=?", (p,))
+    db.commit()
+    log(f"index ready in {time.time() - t0:.1f}s → {DB_PATH}")
+
+# ---------------------------------------------------------------- query
+
+SOURCES = ("claude", "claude-desktop", "codex", "cursor")
+WHEN_HINT = "use an ISO date/time (2026-10-01, 2026-10-01T14:00, 2026-10-01T14:00Z) or relative 90m, 12h, 3d, 2w, today, yesterday"
+
+class HistError(Exception):
+    def __init__(self, msg, hint=None, code=2):
+        super().__init__(msg)
+        self.hint, self.code = hint, code
+
+def parse_when(s, end=False, flag="--since"):
+    if not s:
+        return None
+    try:
+        return _parse_when(s, end)
+    except (ValueError, OverflowError):
+        raise HistError(f"invalid {flag} value {s!r}", WHEN_HINT)
+
+def _parse_when(s, end=False):
+    s = s.strip().lower()
+    now = dt.datetime.now().astimezone()
+    m = re.fullmatch(r"(\d+)\s*([mhdw])", s)
+    if m:
+        n, u = int(m.group(1)), m.group(2)
+        d = now - dt.timedelta(**{{"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[u]: n})
+    elif s in ("today", "yesterday"):
+        d = now.replace(hour=0, minute=0, second=0, microsecond=0) - dt.timedelta(days=s == "yesterday")
+        if end:
+            d += dt.timedelta(days=1)
+    else:
+        d = dt.datetime.fromisoformat(s.upper().replace("Z", "+00:00"))
+        date_only = len(s) == 10
+        if d.tzinfo is None:
+            d = d.astimezone()  # interpret as local time
+        if end and date_only:
+            d += dt.timedelta(days=1)  # --until 2026-10-01 includes that whole day
+    return iso(d.isoformat())
+
+def build_filters(a):
+    msg, sess, args = [], [], []
+    if not a.get("tools") and not a.get("role"):
+        msg.append("m.role in ('user','assistant')")
+    if a.get("role"):
+        msg.append(f"m.role in ({','.join('?' * len(a['role']))})")
+        args += a["role"]
+    if a.get("query"):
+        msg.append("m.text like ? escape '\\'")
+        args.append("%" + re.sub(r"([%_\\])", r"\\\1", a["query"]) + "%")
+    if a.get("regex"):
+        try:
+            re.compile(a["regex"])
+        except re.error as e:
+            raise HistError(f"invalid --regex {a['regex']!r}: {e}", "Python re syntax (rg-compatible for common patterns); use -q for a literal substring")
+        msg.append("m.text regexp ?")
+        args.append(a["regex"])
+    if a.get("since"):
+        msg.append("m.ts >= ?")
+        args.append(parse_when(a["since"], flag="--since"))
+    if a.get("until"):
+        msg.append("m.ts < ?")
+        args.append(parse_when(a["until"], end=True, flag="--until"))
+    sargs = []
+    if a.get("dir"):
+        d = os.path.abspath(os.path.expanduser(a["dir"])).rstrip("/")
+        sess.append("(s.cwd = ? or s.cwd like ? escape '\\')")
+        sargs += [d, re.sub(r"([%_\\])", r"\\\1", d) + "/%"]
+    if a.get("source"):
+        srcs = [x for v in a["source"] for x in v.split(",") if x]
+        sess.append(f"s.source in ({','.join('?' * len(srcs))})")
+        sargs += srcs
+    if not a.get("subagents"):
+        sess.append("s.parent is null")
+    return msg, args, sess, sargs
+
+# title/summary resolution: agent/user annotation > client-native > first prompt
+SESSION_COLS = """s.id, s.source, s.native_id, s.path, s.cwd,
+    coalesce(a.title, s.title, substr(s.first_prompt, 1, 80)) as title,
+    coalesce(a.summary, s.native_summary, substr(s.first_prompt, 1, 400)) as summary,
+    case when a.summary is not null then 'annotation:' || coalesce(a.by, '?')
+         when s.native_summary is not null then 'native' else 'first_prompt' end as summary_source,
+    s.first_prompt, s.last_prompt, a.tags, s.started, s.updated, s.branch, s.n_msgs, s.parent"""
+SESSION_KEYS = ["id", "source", "native_id", "path", "cwd", "title", "summary", "summary_source", "first_prompt",
+                "last_prompt", "tags", "started", "updated", "branch", "n_msgs", "parent"]
+
+def get_session(db, sid):
+    r = db.execute(f"select {SESSION_COLS} from sessions s left join annotations a on a.id=s.id where s.id=?", (sid,)).fetchone()
+    return dict(zip(SESSION_KEYS, r)) if r else None
+
+def validate(db, a):
+    if a.get("source"):
+        srcs = [x.strip() for v in a["source"] for x in v.split(",") if x.strip()]
+        bad = [x for x in srcs if x not in SOURCES]
+        if bad:
+            raise HistError(f"unknown source {', '.join(bad)}", f"valid: {', '.join(SOURCES)} (repeat -s or comma-separate)")
+        a["source"] = srcs
+    if a.get("limit") is not None and int(a["limit"]) < 1:
+        raise HistError("--limit must be >= 1")
+    since, until = parse_when(a.get("since"), flag="--since"), parse_when(a.get("until"), end=True, flag="--until")
+    if since and until and since >= until:
+        raise HistError(f"--since ({a['since']}) is not before --until ({a['until']})", "the window is [since, until)")
+    if a.get("dir"):
+        d = os.path.abspath(os.path.expanduser(a["dir"])).rstrip("/") or "/"
+        a["dir"] = d
+        n = db.execute("select count(*) from sessions where cwd=? or cwd like ? escape '\\'",
+                       (d, re.sub(r"([%_\\])", r"\\\1", d) + "/%")).fetchone()[0]
+        if not n:
+            import difflib
+            known = [r[0] for r in db.execute("select distinct cwd from sessions where cwd is not null")]
+            close = difflib.get_close_matches(d, known, n=5, cutoff=0.4)
+            (lambda m: None if a.get("_quiet") else note(m))(f"no sessions have a working directory under {d}" + (f"; closest: {', '.join(close)}" if close else "; see `hist dirs`"))
+
+def note(msg):
+    print(f"hist: {msg}", file=sys.stderr)
+
+def search(db, a):
+    validate(db, a)
+    msg, margs, sess, sargs = build_filters(a)
+    limit = int(a.get("limit") or 50)
+    has_msg_filter = any(a.get(k) for k in ("query", "regex", "since", "until", "role"))
+    swhere = " and ".join(sess) or "1"
+    if a.get("missing_summary"):
+        swhere += " and a.summary is null"
+    if has_msg_filter:
+        mwhere = " and ".join(msg)
+        sql = f"""select {SESSION_COLS}, count(*) as hits, max(m.ts) as last_hit
+                  from messages m join sessions s on s.id=m.session left join annotations a on a.id=s.id
+                  where {swhere} and {mwhere} group by s.id order by last_hit desc limit ?"""
+        rows = db.execute(sql, sargs + margs + [limit]).fetchall()
+    else:
+        rows = db.execute(f"""select {SESSION_COLS}, 0, s.updated from sessions s left join annotations a on a.id=s.id
+                              where {swhere} order by s.updated desc limit ?""", sargs + [limit]).fetchall()
+    out = []
+    for r in rows:
+        d = dict(zip(SESSION_KEYS + ["hits", "last_hit"], r))
+        d["resume"] = resume_cmd(d)
+        if has_msg_filter:
+            d["hits_preview"] = [
+                {"seq": seq, "ts": ts, "role": role, "snippet": snippet(text, a)}
+                for seq, ts, role, text in db.execute(
+                    f"select m.seq, m.ts, m.role, m.text from messages m join sessions s on s.id=m.session where s.id=? and {' and '.join(msg)} order by m.seq limit 5",
+                    [d["id"]] + margs)]
+        out.append(d)
+    return out
+
+def snippet(text, a, width=220):
+    text = re.sub(r"\s+", " ", text)
+    pos = -1
+    if a.get("regex"):
+        m = re.search(a["regex"], text)
+        pos = m.start() if m else -1
+    elif a.get("query"):
+        pos = text.lower().find(a["query"].lower())
+    if pos < 0:
+        return text[:width]
+    start = max(0, pos - width // 3)
+    return ("…" if start else "") + text[start:start + width]
+
+def resume_cmd(d):
+    if d["source"] == "claude":
+        return f"cd {shq(d['cwd'])} && claude --resume {d['native_id']}" if d["cwd"] else f"claude --resume {d['native_id']}"
+    if d["source"] == "codex":
+        return f"codex resume {d['native_id']}"
+    if d["source"] == "cursor" and d["cwd"]:
+        return f"cursor {shq(d['cwd'])}"
+    return None
+
+def shq(s):
+    return "'" + s.replace("'", "'\\''") + "'" if re.search(r"[^\w@%+=:,./-]", s or "") else s
+
+def resolve_session(db, ref):
+    """Exact id/native id, else unique prefix, else unique substring. Raises HistError(code=3) otherwise."""
+    ref = ref.strip()
+    row = db.execute("select id from sessions where id=? or native_id=?", (ref, ref)).fetchone()
+    if row:
+        return row[0]
+    for pat in (f"{ref}%", f"%{ref}%"):
+        rows = db.execute("""select id, coalesce(title, substr(first_prompt,1,60)), updated from sessions
+                             where native_id like ? or id like ? order by updated desc limit 6""", (pat, pat)).fetchall()
+        if len(rows) == 1:
+            return rows[0][0]
+        if rows:
+            raise HistError(f"session {ref!r} is ambiguous ({len(rows)}+ matches)",
+                            "use a longer prefix: " + "; ".join(f"{r[0]} ({r[1]})" for r in rows[:5]), code=3)
+    raise HistError(f"no session matching {ref!r}", "find ids with `hist search ... --json` (field: id or native_id)", code=3)
+
+def get_messages(db, sid, tools=True):
+    q = "select seq, ts, role, text from messages where session=?" + ("" if tools else " and role!='tool'") + " order by seq"
+    return db.execute(q, (sid,)).fetchall()
+
+# ---------------------------------------------------------------- CLI
+
+def local(ts):
+    if not ts:
+        return "?"
+    try:
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ts
+
+def short_cwd(p):
+    return (p or "?").replace(HOME, "~")
+
+def cmd_search(db, a):
+    res = search(db, a)
+    if a["json"]:
+        for r in res:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+    for r in res:
+        print(f"\033[1m{local(r['last_hit'])}  {r['source']:<14} {r['title'] or '(untitled)'}\033[0m")
+        print(f"  {short_cwd(r['cwd'])}   id={r['native_id']}   {r['n_msgs']} msgs" + (f", {r['hits']} hits" if r['hits'] else ""))
+        print(f"  \033[36m{(r['summary'] or '')[:200]}\033[0m")
+        for h in r.get("hits_preview", []):
+            print(f"    \033[2m{local(h['ts'])} {h['role']:<9}\033[0m {h['snippet'][:160]}")
+    if not res:
+        print("no matches", file=sys.stderr)
+
+def cmd_show(db, a):
+    sid = resolve_session(db, a["session"])
+    s = get_session(db, sid)
+    msgs = get_messages(db, sid, tools=not a["no_tools"])
+    total = len(msgs)
+    if a.get("grep"):
+        try:
+            r = re.compile(a["grep"], re.I)
+        except re.error as e:
+            raise HistError(f"invalid --grep {a['grep']!r}: {e}")
+        msgs = [m for m in msgs if r.search(m[3])]
+    if a.get("range"):
+        m = re.fullmatch(r"(\d*):(\d*)", a["range"])
+        if not m:
+            raise HistError(f"invalid --range {a['range']!r}", "START:END over message seq numbers, e.g. 40:80, :20, 100:")
+        lo, hi = int(m.group(1) or 0), int(m.group(2) or 1 << 30)
+        msgs = [x for x in msgs if lo <= x[0] < hi]
+    if a.get("tail"):
+        msgs = msgs[-a["tail"]:]
+    if a.get("max_chars"):
+        msgs = [(q, ts, role, cap(t, a["max_chars"])) for q, ts, role, t in msgs]
+    if a["json"]:
+        s["resume"] = resume_cmd(s)
+        s["total_messages"] = total
+        s["messages"] = [dict(zip(["seq", "ts", "role", "text"], m)) for m in msgs]
+        print(json.dumps(s, ensure_ascii=False))
+        return
+    print(f"# {s['title'] or '(untitled)'}\n{s['summary'] or ''}\n{s['source']}  {short_cwd(s['cwd'])}  {local(s['started'])} → {local(s['updated'])}\n{s['path']}\nresume: {resume_cmd(s)}\n")
+    for seq, ts, role, text in msgs:
+        print(f"── [{seq}] {role} · {local(ts)}")
+        print(text if role != "tool" else text[:600])
+        print()
+
+def annotate(db, sid, title=None, summary=None, tags=None, by="user"):
+    cur = db.execute("select title, summary, tags from annotations where id=?", (sid,)).fetchone() or (None, None, None)
+    db.execute("insert or replace into annotations values(?,?,?,?,?,?)", (
+        sid, title if title is not None else cur[0], summary if summary is not None else cur[1],
+        tags if tags is not None else cur[2], by, iso(time.time())))
+    db.commit()
+
+def cmd_annotate(db, a):
+    sid = resolve_session(db, a["session"])
+    if a["clear"]:
+        db.execute("delete from annotations where id=?", (sid,)); db.commit()
+    else:
+        annotate(db, sid, a["title"], a["summary"], a["tags"], a["by"])
+    print(json.dumps(get_session(db, sid), ensure_ascii=False))
+
+SUMMARY_PROMPT = """You are labeling a past AI coding-assistant session so it can be found later.
+Return ONLY a JSON object: {"title": "<=8 word specific title", "summary": "2-3 sentences: the goal, what was done/decided, outcome or open state. Name concrete files, systems, PRs, errors."}
+Transcript (user/assistant text only, truncated):
+"""
+
+def condensed(db, sid, budget=14000):
+    msgs = get_messages(db, sid, tools=False)
+    ws = re.compile(r"\s+")
+    parts = [role.upper() + ": " + ws.sub(" ", text)[:1500 if role == "user" else 600] for _, _, role, text in msgs]
+    if sum(map(len, parts)) > budget:  # keep the beginning and end, which carry the goal and outcome
+        head, tail, n = [], [], 0
+        for i in range(len(parts)):
+            for lst, x in ((head, parts[i]), (tail, parts[-1 - i])):
+                if n + len(x) > budget:
+                    break
+                lst.append(x); n += len(x)
+            else:
+                continue
+            break
+        parts = head + ["…"] + tail[::-1]
+    return "\n".join(parts)
+
+def cmd_summarize(db, a):
+    import subprocess
+    if a.get("session"):
+        targets = [get_session(db, resolve_session(db, a["session"]))]
+    else:
+        a["missing_summary"] = not a["force"]
+        targets = search(db, a)
+    if not targets:
+        note("nothing to summarize (all matching sessions already have summaries; --force to redo)")
+        return
+    print(f"summarizing {len(targets)} session(s) with `{a['cmd_line']}` …", file=sys.stderr)
+    for r in targets:
+        try:
+            p = subprocess.run(a["cmd_line"].split(), input=SUMMARY_PROMPT + condensed(db, r["id"]),
+                               capture_output=True, text=True, timeout=180)
+            m = re.search(r"\{.*\}", p.stdout, re.S)
+            d = json.loads(m.group(0))
+            annotate(db, r["id"], d.get("title"), d.get("summary"), None, by="llm")
+            print(f"✓ {r['native_id']}  {d.get('title')}", file=sys.stderr)
+            if a["json"]:
+                print(json.dumps(get_session(db, r["id"]), ensure_ascii=False))
+        except Exception as e:
+            print(f"✗ {r['native_id']}: {e} {(p.stderr or '')[:200] if 'p' in dir() else ''}", file=sys.stderr)
+
+def cmd_dirs(db, a):
+    validate(db, a)
+    where, args = ["s.cwd is not null", "s.parent is null"], []
+    if a.get("source"):
+        where.append(f"s.source in ({','.join('?' * len(a['source']))})"); args += a["source"]
+    if a.get("since"):
+        where.append("s.updated >= ?"); args.append(parse_when(a["since"]))
+    rows = db.execute(f"""select s.cwd, count(*), max(s.updated), group_concat(distinct s.source) from sessions s
+                          where {' and '.join(where)} group by s.cwd order by max(s.updated) desc limit ?""",
+                      args + [a["limit"]]).fetchall()
+    if a["json"]:
+        for r in rows:
+            print(json.dumps(dict(zip(["cwd", "sessions", "last_active", "sources"], r))))
+        return
+    for cwd, n, last, srcs in rows:
+        print(f"{local(last)}  {n:>4}  {short_cwd(cwd):<70} {srcs}")
+
+def cmd_sources(db, a):
+    rows = db.execute("select source, count(*), min(started), max(updated), sum(n_msgs) from sessions group by source").fetchall()
+    if a["json"]:
+        print(json.dumps([dict(zip(["source", "sessions", "first", "last", "messages"], r)) for r in rows]))
+        return
+    for r in rows:
+        print(f"{r[0]:<15} {r[1]:>6} sessions {r[4]:>8} msgs   {local(r[2])} → {local(r[3])}")
+
+# ---------------------------------------------------------------- TUI
+
+FIELDS = [("query", "Text"), ("regex", "Regex"), ("dir", "Dir"), ("since", "Since"), ("until", "Until"), ("source", "Source")]
+HELP = "/ live search · R reindex · ↑↓ move · enter open/edit · / text · d dir · s since · u until · x source · t tools · a subagents · y copy resume · q quit"
+
+class TUI:
+    def __init__(self, db, init):
+        self.db, self.f = db, {k: "" for k, _ in FIELDS}
+        for k in self.f:
+            v = init.get(k)
+            self.f[k] = ",".join(v) if isinstance(v, list) else (v or "")
+        self.tools, self.subagents = bool(init.get("tools")), False
+        self.results, self.sel, self.top, self.err, self.msg = [], 0, 0, "", ""
+
+    def args(self):
+        a = {k: v for k, v in self.f.items() if v}
+        if "source" in a:
+            a["source"] = [a["source"]]
+        a.update(tools=self.tools, subagents=self.subagents, limit=300, _quiet=True)
+        return a
+
+    def refresh(self):
+        try:
+            t = time.time()
+            self.results, self.err = search(self.db, self.args()), ""
+            self.msg = f"{len(self.results)} sessions · {time.time() - t:.2f}s"
+        except Exception as e:
+            self.results, self.err = [], str(e)
+        self.sel, self.top = 0, 0
+
+    def run(self, scr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        for i, c in enumerate([curses.COLOR_CYAN, curses.COLOR_YELLOW, curses.COLOR_GREEN, curses.COLOR_MAGENTA, curses.COLOR_RED], 1):
+            curses.init_pair(i, c, -1)
+        self.scr = scr
+        self.refresh()
+        self.edit("query")  # fzf-style: start typing immediately
+        while True:
+            self.draw()
+            k = scr.get_wch()
+            if k in ("q", "\x1b"):
+                return
+            keymap = {"/": "query", "r": "regex", "d": "dir", "s": "since", "u": "until", "x": "source"}
+            if k in keymap:
+                self.edit(keymap[k])
+            elif k == "R":
+                self.msg = "re-indexing…"; self.draw()
+                index(self.db, quiet=True); self.refresh()
+            elif k == "t":
+                self.tools = not self.tools; self.refresh()
+            elif k == "a":
+                self.subagents = not self.subagents; self.refresh()
+            elif k == "c":
+                for key in self.f: self.f[key] = ""
+                self.refresh()
+            elif k in (curses.KEY_DOWN, "j"):
+                self.sel = min(self.sel + 1, len(self.results) - 1)
+            elif k in (curses.KEY_UP, "k"):
+                self.sel = max(self.sel - 1, 0)
+            elif k == curses.KEY_NPAGE:
+                self.sel = min(self.sel + 10, len(self.results) - 1)
+            elif k == curses.KEY_PPAGE:
+                self.sel = max(self.sel - 10, 0)
+            elif k in ("\n", curses.KEY_ENTER, "l", curses.KEY_RIGHT) and self.results:
+                self.view(self.results[self.sel])
+            elif k == "y" and self.results:
+                self.copy(self.results[self.sel].get("resume") or self.results[self.sel]["path"])
+            elif k == "p" and self.results:
+                self.copy(self.results[self.sel]["path"])
+
+    def copy(self, s):
+        try:
+            import subprocess
+            subprocess.run(["pbcopy"], input=s.encode(), check=True)
+            self.msg = f"copied: {s}"
+        except Exception as e:
+            self.msg = f"copy failed: {e}"
+
+    def put(self, y, x, s, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w:
+            try:
+                self.scr.addnstr(y, x, s.replace("\n", " "), w - x - 1, attr)
+            except curses.error:
+                pass
+
+    def draw(self, footer=True):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        x = 0
+        for k, label in FIELDS:
+            key = {"query": "/", "regex": "r", "dir": "d", "since": "s", "until": "u", "source": "x"}[k]
+            seg = f"{label}[{key}]: "
+            self.put(0, x, seg, curses.color_pair(1))
+            val = self.f[k] or "·"
+            self.put(0, x + len(seg), val, curses.A_BOLD if self.f[k] else curses.A_DIM)
+            x += len(seg) + len(val) + 2
+        flags = f"tools[t]:{'on' if self.tools else 'off'}  subagents[a]:{'on' if self.subagents else 'off'}  clear[c]"
+        self.put(1, 0, flags, curses.A_DIM)
+        self.put(1, max(0, w - len(self.msg) - 2), self.err or self.msg, curses.color_pair(5) if self.err else curses.A_DIM)
+        list_h = max(3, (h - 4) // 2)
+        if self.sel < self.top:
+            self.top = self.sel
+        if self.sel >= self.top + list_h:
+            self.top = self.sel - list_h + 1
+        for i, r in enumerate(self.results[self.top:self.top + list_h]):
+            idx = self.top + i
+            attr = curses.A_REVERSE if idx == self.sel else 0
+            src = {"claude": "CC", "claude-desktop": "CD", "codex": "CX", "cursor": "CU"}.get(r["source"], "??")
+            hits = f"{r['hits']:>4}" if r["hits"] else "    "
+            line = f"{local(r['last_hit'])} {src} {hits} {(r['title'] or '(untitled)')[:60]:<60} {short_cwd(r['cwd'])}"
+            self.put(2 + i, 0, line.ljust(w), attr)
+        y = 3 + list_h
+        self.put(y - 1, 0, "─" * (w - 1), curses.A_DIM)
+        if self.results:
+            r = self.results[self.sel]
+            self.put(y, 0, f"{r['title'] or '(untitled)'}", curses.A_BOLD)
+            self.put(y + 1, 0, f"{r['source']}  {short_cwd(r['cwd'])}  {r['branch'] or ''}  {local(r['started'])} → {local(r['updated'])}  {r['n_msgs']} msgs", curses.color_pair(1))
+            self.put(y + 2, 0, f"resume: {r['resume'] or '-'}", curses.A_DIM)
+            yy = y + 3
+            for ln in textwrap.wrap(r["summary"] or "", w - 2)[:3]:
+                self.put(yy, 0, ln, curses.color_pair(3)); yy += 1
+            if r["last_prompt"] and r["last_prompt"] != r["first_prompt"] and not r.get("hits_preview"):
+                self.put(yy, 0, "last prompt: " + r["last_prompt"], curses.A_DIM); yy += 1
+            items = r.get("hits_preview") or []
+            for hp in items:
+                if yy >= h - 1:
+                    break
+                self.put(yy, 0, f"{local(hp['ts'])} {hp['role']}", curses.color_pair(2))
+                for ln in textwrap.wrap(hp["snippet"], w - 4)[:3]:
+                    yy += 1
+                    self.put(yy, 2, ln)
+                yy += 1
+        if footer:
+            self.put(h - 1, 0, HELP, curses.A_DIM)
+        scr.refresh()
+
+    def edit(self, field, live=True):
+        """Line editor for one filter. Results update as you type (debounced); ↑↓ move the selection meanwhile.
+        enter = keep & go to the list (on the text/regex field: open the selected session), esc = revert."""
+        label = dict(FIELDS)[field]
+        hint = {"since": " (2026-10-01, 3d, 12h, today)", "until": " (date or 2d)", "source": " (claude,claude-desktop,codex,cursor)",
+                "dir": " (path; . = cwd)", "regex": " (python/rg regex)", "query": " (live · ↑↓ select · enter open · tab list · esc clear)"}.get(field, "")
+        orig, buf, pos = self.f[field], self.f[field], len(self.f[field])
+        dirty, open_after = False, False
+        curses.curs_set(1)
+        self.scr.timeout(90)  # debounce: search once typing pauses for 90ms
+        while True:
+            self.draw(footer=False)
+            h, w = self.scr.getmaxyx()
+            prompt = f"{label}{hint}: "
+            self.put(h - 1, 0, " " * (w - 1))
+            self.put(h - 1, 0, prompt, curses.color_pair(1))
+            self.put(h - 1, len(prompt), buf, curses.A_BOLD)
+            self.scr.move(h - 1, min(w - 2, len(prompt) + pos))
+            try:
+                k = self.scr.get_wch()
+            except curses.error:  # timeout → run the pending search
+                if dirty and live:
+                    self.apply(field, buf)
+                    dirty = False
+                continue
+            if k in ("\n", curses.KEY_ENTER):
+                open_after = field in ("query", "regex") and bool(buf)
+                break
+            if k == "\t":
+                break
+            if k == "\x1b":
+                buf = orig if field not in ("query", "regex") or buf == orig else ""
+                if buf == orig and field in ("query", "regex"):
+                    break
+                pos, dirty = len(buf), True
+                if field not in ("query", "regex"):
+                    break
+                continue
+            if k in (curses.KEY_DOWN, "\x0e"):  # ↓ / ctrl-n
+                self.sel = min(self.sel + 1, max(0, len(self.results) - 1)); continue
+            if k in (curses.KEY_UP, "\x10"):    # ↑ / ctrl-p
+                self.sel = max(self.sel - 1, 0); continue
+            if k == curses.KEY_NPAGE:
+                self.sel = min(self.sel + 10, max(0, len(self.results) - 1)); continue
+            if k == curses.KEY_PPAGE:
+                self.sel = max(self.sel - 10, 0); continue
+            if k == curses.KEY_LEFT:
+                pos = max(0, pos - 1); continue
+            if k == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1); continue
+            if k in ("\x01", curses.KEY_HOME):
+                pos = 0; continue
+            if k in ("\x05", curses.KEY_END):
+                pos = len(buf); continue
+            if k in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                if pos:
+                    buf, pos = buf[:pos - 1] + buf[pos:], pos - 1
+            elif k == "\x15":  # ctrl-u
+                buf, pos = buf[pos:], 0
+            elif k == "\x17":  # ctrl-w: delete previous word
+                left = re.sub(r"\S*\s*$", "", buf[:pos])
+                buf, pos = left + buf[pos:], len(left)
+            elif k == curses.KEY_RESIZE:
+                continue
+            elif isinstance(k, str) and k.isprintable():
+                buf, pos = buf[:pos] + k + buf[pos:], pos + 1
+            else:
+                continue
+            dirty = True
+        self.scr.timeout(-1)
+        curses.curs_set(0)
+        if dirty or self.f[field] != buf or field == "dir" and buf == ".":
+            self.apply(field, buf)
+        if open_after and self.results and not self.err:
+            self.view(self.results[self.sel])
+
+    def apply(self, field, buf):
+        if field == "dir" and buf == ".":
+            buf = os.getcwd()
+        if field in ("since", "until") and buf and buf[-1:].isdigit() and not re.fullmatch(r"\d{4}-\d\d-\d\d.*", buf):
+            return  # mid-typing "3" of "3d": don't flash an error
+        self.f[field] = buf
+        keep = self.results[self.sel]["id"] if self.results and self.sel < len(self.results) else None
+        self.refresh()
+        ids = [r["id"] for r in self.results]
+        if keep in ids:
+            self.sel = ids.index(keep)
+
+    def view(self, r):
+        a = self.args()
+        msgs = get_messages(self.db, r["id"], tools=self.tools)
+        hit_re = None
+        if a.get("regex"):
+            hit_re = re.compile(a["regex"])
+        elif a.get("query"):
+            hit_re = re.compile(re.escape(a["query"]), re.I)
+        h, w = self.scr.getmaxyx()
+        lines, hit_lines = [], []
+        for seq, ts, role, text in msgs:
+            color = {"user": 3, "assistant": 1, "tool": 4}.get(role, 0)
+            is_hit = bool(hit_re and hit_re.search(text))
+            if is_hit:
+                hit_lines.append(len(lines))
+            lines.append((f"── {role} · {local(ts)}" + ("  ◀ match" if is_hit else ""), curses.color_pair(color) | curses.A_BOLD, None))
+            body = text if role != "tool" else text[:800]
+            for para in body.split("\n"):
+                for ln in textwrap.wrap(para, w - 2) or [""]:
+                    lines.append((ln, 0, hit_re))
+            lines.append(("", 0, None))
+        top = hit_lines[0] if hit_lines else 0
+        while True:
+            self.scr.erase()
+            h, w = self.scr.getmaxyx()
+            self.put(0, 0, f"{r['title'] or '(untitled)'} — {short_cwd(r['cwd'])}", curses.A_BOLD | curses.A_REVERSE)
+            for i, (ln, attr, hr) in enumerate(lines[top:top + h - 2]):
+                self.put(1 + i, 0, ln, attr)
+                if hr:
+                    for m in hr.finditer(ln):
+                        if m.end() > m.start():
+                            self.put(1 + i, m.start(), ln[m.start():m.end()], curses.color_pair(2) | curses.A_REVERSE)
+            self.put(h - 1, 0, f"{top + 1}/{len(lines)}  ↑↓ pgup/pgdn g/G · n/N next/prev match · y copy resume · q back", curses.A_DIM)
+            self.scr.refresh()
+            k = self.scr.get_wch()
+            if k in ("q", "\x1b", "h", curses.KEY_LEFT):
+                return
+            elif k in (curses.KEY_DOWN, "j"):
+                top = min(top + 1, max(0, len(lines) - 1))
+            elif k in (curses.KEY_UP, "k"):
+                top = max(top - 1, 0)
+            elif k in (curses.KEY_NPAGE, " "):
+                top = min(top + h - 3, max(0, len(lines) - 1))
+            elif k == curses.KEY_PPAGE:
+                top = max(top - (h - 3), 0)
+            elif k == "g":
+                top = 0
+            elif k == "G":
+                top = max(0, len(lines) - h + 2)
+            elif k == "n":
+                nxt = [i for i in hit_lines if i > top]
+                top = nxt[0] if nxt else top
+            elif k == "N":
+                prv = [i for i in hit_lines if i < top]
+                top = prv[-1] if prv else top
+            elif k == "y":
+                self.copy(r.get("resume") or r["path"])
+
+# ---------------------------------------------------------------- main
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise HistError(message, f"see `{self.prog} --help`")
+
+def main():
+    F = argparse.RawDescriptionHelpFormatter
+    p = Parser(prog="hist", description=__doc__, formatter_class=F, add_help=True)
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND", parser_class=Parser)
+
+    def cmd(name, help, examples):
+        return sub.add_parser(name, help=help, description=help, formatter_class=F,
+                              epilog="examples:\n" + "\n".join("  " + e for e in examples))
+
+    def filters(sp, limit=50):
+        g = sp.add_argument_group("filters (AND-ed; message filters must match the same message)")
+        g.add_argument("-q", "--query", metavar="TEXT", help="case-insensitive literal substring (like rg -F -i)")
+        g.add_argument("-e", "--regex", metavar="RE", help="regex, case-sensitive unless (?i) (like rg -e)")
+        g.add_argument("-d", "--dir", metavar="PATH", help="session cwd is PATH or below it; '.' = current dir")
+        g.add_argument("--since", metavar="WHEN", help="message sent at/after WHEN: 2026-10-01, 2026-10-01T14:00, 3d, 12h, today")
+        g.add_argument("--until", metavar="WHEN", help="message sent before WHEN (a bare date includes that whole day)")
+        g.add_argument("-s", "--source", action="append", metavar="SRC", help=f"{'|'.join(SOURCES)}; repeat or comma-separate")
+        g.add_argument("--role", action="append", choices=["user", "assistant", "tool"], help="restrict matching messages by role")
+        g.add_argument("--tools", action="store_true", help="also match tool calls/outputs (default: user+assistant text)")
+        g.add_argument("--subagents", action="store_true", help="include subagent sessions (hidden by default)")
+        g.add_argument("--missing-summary", action="store_true", help="only sessions without an annotation summary")
+        o = sp.add_argument_group("output")
+        o.add_argument("-n", "--limit", type=int, default=limit, metavar="N", help=f"max sessions (default {limit})")
+        o.add_argument("--json", action="store_true", help="JSONL: one session object per line")
+        o.add_argument("--no-index", action="store_true", help="skip the incremental refresh")
+
+    filters(cmd("search", "find sessions; newest matching activity first", [
+        'hist search -q "connection refused" --json',
+        'hist search -d ~/src/app --since 2026-10-01 --until 2026-10-03 --json',
+        'hist search -e "TODO\\(\\w+\\)" -s claude,codex --role user --json',
+        'hist search --since 4h --json   # sessions with any message in the last 4 hours',
+        "JSON fields: id native_id source title summary summary_source first_prompt last_prompt tags cwd branch",
+        "             started updated n_msgs hits last_hit resume path hits_preview[{seq ts role snippet}]",
+    ]))
+    filters(cmd("tui", "interactive search (the default when run with no command)", ["hist", "hist -d . --since 7d"]))
+
+    sp = cmd("show", "print one session's transcript", [
+        "hist show <id> --json                     # id, native_id, or any unique prefix",
+        'hist show claude:c40fd05c --grep "migration" --json',
+        "hist show <id> --range 40:80 --max-chars 1500 --json",
+        "hist show <id> --tail 10 --no-tools",
+        "JSON: session fields + total_messages + messages[{seq ts role text}]",
+    ])
+    sp.add_argument("session", help="id (source:native_id), native id, or unique prefix/substring")
+    sp.add_argument("--grep", metavar="RE", help="only messages matching RE (case-insensitive)")
+    sp.add_argument("--range", metavar="A:B", help="only messages with A <= seq < B")
+    sp.add_argument("--tail", type=int, metavar="N", help="only the last N messages (after other filters)")
+    sp.add_argument("--max-chars", type=int, metavar="N", help="truncate each message to N chars")
+    sp.add_argument("--no-tools", action="store_true", help="omit tool calls/outputs")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--no-index", action="store_true")
+
+    sp = cmd("dirs", "list working directories that have sessions, most recently active first", [
+        "hist dirs --json", "hist dirs -s cursor --since 7d"])
+    sp.add_argument("-s", "--source", action="append", metavar="SRC")
+    sp.add_argument("--since", metavar="WHEN", help="only dirs with activity since WHEN")
+    sp.add_argument("-n", "--limit", type=int, default=100, metavar="N")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--no-index", action="store_true")
+
+    sp = cmd("annotate", "attach a title/summary/tags to a session; wins over native titles and survives re-index", [
+        'hist annotate <id> --title "Bazel cache audit" --summary "..." --tags bazel,ci --by my-agent',
+        "hist annotate <id> --clear"])
+    sp.add_argument("session")
+    sp.add_argument("--title")
+    sp.add_argument("--summary")
+    sp.add_argument("--tags", help="comma separated")
+    sp.add_argument("--by", default=os.environ.get("HIST_AGENT", "user"), help="author label (default $HIST_AGENT or 'user')")
+    sp.add_argument("--clear", action="store_true", help="remove the annotation")
+
+    sp = cmd("summarize", "LLM-generate title+summary for sessions lacking an annotation (runs only when asked)", [
+        "hist summarize <id>", "hist summarize -d ~/src/app --since 14d -n 20",
+        'HIST_SUMMARIZER="codex exec" hist summarize -s cursor'])
+    sp.add_argument("session", nargs="?", help="one session; otherwise the filters select up to -n sessions")
+    filters(sp, limit=10)
+    sp.add_argument("--force", action="store_true", help="also redo sessions that already have a summary")
+    sp.add_argument("--cmd-line", default=os.environ.get("HIST_SUMMARIZER", "claude -p --model haiku"),
+                    help="command reading the prompt on stdin, printing JSON (default: $HIST_SUMMARIZER or claude -p --model haiku)")
+
+    sp = cmd("index", "refresh the index (incremental; --full re-parses everything)", ["hist index", "hist index --full"])
+    sp.add_argument("--full", action="store_true")
+    sp = cmd("sources", "per-client counts and date ranges", ["hist sources --json"])
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--no-index", action="store_true")
+    cmd("help", "show this help", ["hist help", "hist help search"]).add_argument("topic", nargs="?")
+
+    argv = sys.argv[1:] or ["tui"]
+    if argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
+        argv = ["tui"] + argv
+    a = vars(p.parse_args(argv))
+    if a["cmd"] == "help":
+        return (sub.choices[a["topic"]] if a.get("topic") in sub.choices else p).print_help()
+    if a["cmd"] == "tui" and not sys.stdout.isatty():
+        raise HistError("the TUI needs a terminal", "agents: use `hist search --json` / `hist show --json` (see `hist help`)")
+    db = connect()
+    empty = not db.execute("select 1 from sessions limit 1").fetchone()
+    if a["cmd"] == "index":
+        index(db, full=a["full"])
+        return cmd_sources(db, {"json": False})
+    if (not a.get("no_index") or empty) and a["cmd"] != "annotate":
+        index(db, quiet=a.get("json") or not sys.stderr.isatty())
+    os.environ.setdefault("ESCDELAY", "25")  # snappy esc in the TUI
+    {"search": cmd_search, "show": cmd_show, "sources": cmd_sources, "dirs": cmd_dirs, "annotate": cmd_annotate,
+     "summarize": cmd_summarize}.get(a["cmd"], lambda db, a: curses.wrapper(TUI(db, a).run))(db, a)
+
+def fail(msg, hint=None, code=1):
+    if "--json" in sys.argv:
+        print(json.dumps({"error": msg, "hint": hint, "code": code}))
+    else:
+        print(f"hist: error: {msg}" + (f"\nhint: {hint}" if hint else ""), file=sys.stderr)
+    sys.exit(code)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        pass
+    except HistError as e:
+        fail(str(e), e.hint, e.code)
+    except KeyboardInterrupt:
+        sys.exit(130)
