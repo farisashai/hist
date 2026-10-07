@@ -48,3 +48,20 @@ match), `tab` drops to the list. In the list: `/` text, `r` regex, `d` dir (`.` 
 - Plain ChatGPT chats and claude.ai chats live server-side, not on disk.
 - Cursor background-agent details cached as protobuf (`bcCachedDetails`) aren't decoded; their conversations show
   up through the regular composer records when synced.
+
+## Code layout
+
+Python 3.9+ standard library only. `./hist` is a small launcher (safe to symlink onto PATH); the code is in `agenthist/`:
+
+| module | what it does |
+|---|---|
+| `cli.py` | argument parsing, the subcommands, error reporting / exit codes |
+| `tui.py` | curses UI: filter bar, live search box (`LineEditor`), result list, `TranscriptView` |
+| `query.py` | `Query` (validated filters → SQL), `search`, directory and source listings |
+| `store.py` | SQLite schema, `Session` record, writing/reading sessions, annotations |
+| `sources/` | one parser per client (`claude.py`, `codex.py`, `cursor.py`) plus the incremental indexing driver |
+| `summarize.py` | on-demand LLM titles/summaries |
+| `util.py` | errors, timestamps, text cleanup, display formatting |
+
+To support another client, add `sources/<name>.py` with `index(db, paths, full) -> int` that builds `store.Session`
+objects and saves them (file-based clients can reuse `index_files`), then register it in `sources/__init__.py`.
