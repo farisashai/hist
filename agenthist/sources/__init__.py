@@ -52,7 +52,12 @@ def index_all(db: sqlite3.Connection, full: bool = False, quiet: bool = False, p
     paths = paths or Paths.for_home()
     started = time.time()
     for name, module in (("claude", claude), ("codex", codex), ("cursor", cursor)):
-        updated = module.index(db, paths, full)
+        try:
+            updated = module.index(db, paths, full)
+        except Exception as e:  # one client's unreadable data must not block searching the others
+            db.rollback()
+            print(f"hist: {name} not re-indexed ({type(e).__name__}: {e}); its results may be stale", file=sys.stderr)
+            continue
         db.commit()
         if updated and not quiet:
             print(f"{name}: {updated} sessions updated", file=sys.stderr)

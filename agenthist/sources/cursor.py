@@ -14,7 +14,7 @@ import json
 import os
 import re
 import sqlite3
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from .. import store
 from ..store import Session
@@ -34,7 +34,7 @@ def index(db, paths: Paths, full: bool) -> int:
 # ---------------------------------------------------------------- composers (state.vscdb)
 
 def index_composers(db, paths: Paths, full: bool) -> tuple[set[str], int]:
-    cursor_db = sqlite3.connect(f"file:{paths.cursor_state_db}?mode=ro", uri=True)
+    cursor_db = open_state_db(paths.cursor_state_db)
     cursor_db.text_factory = lambda b: b.decode("utf-8", "replace")
     workspace_dirs = load_workspace_dirs(paths.cursor_workspaces)
     workspace_of = load_composer_workspaces(cursor_db)
@@ -64,6 +64,21 @@ def index_composers(db, paths: Paths, full: bool) -> tuple[set[str], int]:
 
     remove_deleted_composers(db, seen)
     return seen, updated
+
+
+def open_state_db(path: str) -> sqlite3.Connection:
+    """Open Cursor's state DB without writing to it.
+
+    It is in WAL mode, and when Cursor isn't running its -wal/-shm files are gone; a read-only connection
+    can't recreate them and fails with "unable to open database file". Then nothing is mid-write, so the
+    file can safely be read as immutable."""
+    uri = f"file:{quote(path)}"
+    try:
+        cursor_db = sqlite3.connect(f"{uri}?mode=ro", uri=True)
+        cursor_db.execute("select 1 from cursorDiskKV limit 1")
+        return cursor_db
+    except sqlite3.OperationalError:
+        return sqlite3.connect(f"{uri}?immutable=1", uri=True)
 
 
 def parse_composer(cursor_db, composer: dict, composer_id: str, db_path: str) -> Session:
