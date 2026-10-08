@@ -8,7 +8,7 @@ import re
 import sys
 
 from . import __doc__ as OVERVIEW
-from . import store
+from . import hooks, install, ready, store
 from .query import Query, dir_warning, list_dirs, parse_sources, parse_when, resume_command, search, source_stats
 from .sources import SOURCES, index_all
 from .summarize import DEFAULT_COMMAND, summarize_session
@@ -156,6 +156,45 @@ def cmd_tui(db, args: dict) -> None:
     curses.wrapper(TUI(db, args).run)
 
 
+def cmd_ready(args: dict) -> None:
+    root = ready.repo_root(os.path.abspath(os.path.expanduser(args["dir"] or ".")))
+    if not root:
+        raise HistError("not inside a git repository", "run it from your checkout or pass -d PATH")
+    report = ready.scan(root, prompt=args["request"])
+    rules = hooks.cm_rules(args["request"], root, hooks.STOP_RULE_LIMIT) if args["request"] else []
+    if args["json"]:
+        print_json({**report.to_dict(), "rules": rules})
+        return
+    print(f"{short_path(root)}: {len(report.files)} changed files vs {(report.base or 'HEAD')[:10]}")
+    print(hooks.checklist(report, rules) or "Nothing to flag, and no CI command found for these files.")
+
+
+def cmd_hook(args: dict) -> None:
+    hooks.main(args["event"], args["client"])
+
+
+def cmd_install_hooks(args: dict) -> None:
+    clients = args["client"] or list(install.TARGETS)
+    for client in clients:
+        path, before, after = install.plan(client, install=not args["uninstall"])
+        if before == after:
+            print(f"{client}: {short_path(path)} already up to date")
+            continue
+        print(install.diff(path, before, after) or f"{client}: {short_path(path)} unchanged")
+        if args["dry_run"]:
+            continue
+        backup = install.apply(path, before, after)
+        print(f"{client}: wrote {short_path(path)}" + (f" (backup: {short_path(backup)})" if backup else ""))
+    if not args["dry_run"] and not args["uninstall"]:
+        if "codex" in clients:
+            note("Codex asks you to review new hooks once: open Codex and approve the two `hist hook` entries.")
+        if "cursor" in clients:
+            note("Cursor picks up ~/.cursor/hooks.json after a restart.")
+
+
+# Commands that never need the session index (the hooks must stay fast).
+INDEXLESS_COMMANDS = {"ready": cmd_ready, "hook": cmd_hook, "install-hooks": cmd_install_hooks}
+
 COMMANDS = {
     "search": cmd_search,
     "show": cmd_show,
@@ -251,6 +290,24 @@ def build_parser() -> tuple[Parser, argparse._SubParsersAction]:
     sources.add_argument("--json", action="store_true")
     sources.add_argument("--no-index", action="store_true")
 
+    check = command("ready", "merge-readiness scan of the current branch: scope, narrating comments, new tests, "
+                             "debug output, TODOs, and the CI command to run", [
+        "hist ready", 'hist ready --request "fix the radius in web/src/chart.tsx"', "hist ready --json"])
+    check.add_argument("-d", "--dir", metavar="PATH", help="repository (default: current directory)")
+    check.add_argument("--request", metavar="TEXT", help="what was asked: enables the scope check and cm rules")
+    check.add_argument("--json", action="store_true")
+
+    hook = command("hook", "lifecycle hook entry point (called by Claude Code, Codex and Cursor; reads JSON on stdin)", [
+        "hist hook stop --client claude < payload.json"])
+    hook.add_argument("event", choices=["prompt", "stop"])
+    hook.add_argument("--client", required=True, choices=["claude", "codex", "cursor"])
+
+    installer = command("install-hooks", "add (or remove) the hist hooks in Claude Code, Codex and Cursor user config", [
+        "hist install-hooks --dry-run", "hist install-hooks --client claude", "hist install-hooks --uninstall"])
+    installer.add_argument("--client", action="append", choices=list(install.TARGETS), help="default: all three")
+    installer.add_argument("--dry-run", action="store_true", help="show the diff without writing")
+    installer.add_argument("--uninstall", action="store_true", help="remove the hist hooks")
+
     command("help", "show this help", ["hist help", "hist help search"]).add_argument("topic", nargs="?")
     return parser, commands
 
@@ -301,6 +358,9 @@ def run(argv: list[str]) -> None:
     if command == "help":
         topic = commands.choices.get(args.get("topic"), parser)
         topic.print_help()
+        return
+    if command in INDEXLESS_COMMANDS:
+        INDEXLESS_COMMANDS[command](args)
         return
     if command == "tui" and not sys.stdout.isatty():
         raise HistError("the TUI needs a terminal", "agents: use `hist search --json` / `hist show --json` (see `hist help`)")

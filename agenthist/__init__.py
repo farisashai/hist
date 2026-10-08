@@ -12,6 +12,8 @@ Commands:
   annotate    attach your own title/summary/tags to a session (persists across re-index)
   summarize   LLM-fill missing titles/summaries on demand (default: claude -p --model haiku)
   index       refresh the index now (search/show/dirs already refresh incrementally, ~0.2s)
+  ready       merge-readiness scan of the current branch (scope, narrating comments, new tests, debug, CI command)
+  install-hooks  wire the merge-ready gate into Claude Code, Codex and Cursor (hook = the entry point they call)
 
 Typical agent flow:
   hist dirs --json                                              # which roots exist

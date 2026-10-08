@@ -37,6 +37,55 @@ errors are `{"error", "hint", "code"}` on stdout; progress and notes always go t
 - Each result has `title`, `summary` (`summary_source`: annotation > native > first_prompt), `first_prompt`,
   `last_prompt`, `resume` (shell command to reopen it), and `path` (raw transcript).
 
+## Merge-ready gate (task-completion hook)
+
+When an agent finishes a turn that changed code, it is sent back **once** with a short checklist; the next stop always
+goes through. Turns that changed nothing (questions, reviews) are never interrupted.
+
+- **Scope**: files changed this turn that the request didn't name (only when it named real paths).
+- **Narrating comments** (`// Now we…`, `# Added…`), **new test/story files**, **debug output**, **TODO/FIXME**.
+- **Checks**: the command CI runs for those files (nearest `package.json` with `check:all`, or your own map in
+  `~/.config/agent-history/checks.json`: `{"checks": [{"repo": "monorepo", "paths": "backend/*", "command": "..."}]}`).
+- **Your rules**: the most relevant entries from your `cm` playbook (see below), if any.
+
+```sh
+hist ready                       # the same scan, by hand, on the current branch
+hist ready --request "fix the radius in web/src/chart.tsx" --json
+hist install-hooks --dry-run     # show the config diff for Claude Code, Codex and Cursor
+hist install-hooks               # install (backs up ~/.claude/settings.json); --uninstall removes only these hooks
+```
+
+The prompt hook snapshots the working tree (so the stop hook knows what *this turn* changed) and adds up to three
+proven `cm` rules that match the request (skipped without a process spawn while your playbooks are empty).
+
+The stop hook also reads the turn's own transcript (Claude Code and Codex), so it stays quiet about work that isn't
+the agent's:
+
+- **Only content changes count.** The snapshot records each file's change against the merge base, so a turn that
+  just commits, rebases or undoes a commit (`git reset --soft`) isn't gated on files whose content it didn't touch.
+- **A turn with no tool calls** (a status reply, a task notification) is never gated: whatever changed was done
+  by someone else, e.g. a background subagent or you in your editor.
+- **Another agent in the same checkout** (e.g. Claude waiting on a background Codex task): only files this turn's
+  own tools wrote are checked; the other agent's edits go through its own gate. A turn that never recorded a stop
+  counts as running until its transcript has been idle for 15 minutes.
+- **Checks already run** after the agent's last edit aren't asked for again; several packages become one item.
+- **Tests**: a file's own test/story (`chart.test.tsx` for `chart.tsx`) is in scope, and new test files aren't
+  flagged when the request asks for tests ("add a test", "coverage", "tests for …").
+- **Comments**: only the first line of a comment block can count as narration.
+
+Hooks fail open and log to `~/.cache/agent-history/hooks.log`, including what each stop flagged (`items`), how many
+files changed, and any concurrent sessions, so you can tune from real runs.
+Codex asks you to approve new hooks once; Cursor reads `~/.cursor/hooks.json` after a restart.
+
+## Companion tools (not reimplemented here)
+
+- **Memory of how you like agents to work**: [`cm`](https://github.com/Dicklesworthstone/cass_memory_system)
+  (`brew install dicklesworthstone/tap/cm`) distills rules from session history with evidence, confidence decay and
+  harmful-feedback inversion. `cm context "<task>"` is what the hooks read.
+- **Orchestrator → executor**: [`codex-plugin-cc`](https://github.com/openai/codex-plugin-cc) lets Claude Code delegate
+  to Codex (`/codex:rescue --background <task>`, `/codex:review`). It uses `~/.codex/config.toml`, so delegated work
+  runs on your default Codex model and service tier.
+
 ## TUI
 
 `hist` (or `hist -d . --since 7d` to pre-filter). Opens fzf-style in the search box: results and the preview
