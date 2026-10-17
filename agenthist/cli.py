@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 
 from . import __doc__ as OVERVIEW
@@ -154,7 +155,17 @@ def cmd_tui(db, args: dict) -> None:
 
     os.environ.setdefault("ESCDELAY", "25")  # make esc respond immediately
     avoid_broken_rep()
-    curses.wrapper(TUI(db, args).run)
+    launch = curses.wrapper(TUI(db, args).run)
+    if launch:
+        argv, cwd = launch
+        db.close()
+        if cwd:
+            os.chdir(cwd)
+        print(f"$ {shlex.join(argv)}", file=sys.stderr)
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as e:
+            raise HistError(f"couldn't run {argv[0]}: {e}")
 
 
 def cmd_ready(args: dict) -> None:

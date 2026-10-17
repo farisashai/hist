@@ -11,6 +11,7 @@ import difflib
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 from dataclasses import dataclass, field
 
@@ -225,16 +226,32 @@ def and_all(conditions: list[str]) -> str:
     return " and ".join(conditions) or "1"
 
 
+def resume_argv(session: dict) -> tuple[list[str], str | None] | None:
+    """The command (and working directory to run it in) that reopens the conversation in its client."""
+    source, native_id, cwd = session["source"], session["native_id"], session["cwd"]
+    if cwd and not os.path.isdir(cwd):
+        cwd = None
+    if source == "claude":
+        return ["claude", "--resume", native_id], cwd
+    if source == "codex":
+        return ["codex", "resume", native_id], cwd
+    if source == "cursor":
+        agent = shutil.which("cursor-agent")
+        if agent:
+            return [agent, "--resume", native_id], cwd
+        if cwd:  # no CLI agent: open the workspace in the IDE, where the chat lives
+            return (["cursor", cwd] if shutil.which("cursor") else ["open", "-a", "Cursor", cwd]), None
+    return None
+
+
 def resume_command(session: dict) -> str | None:
     """A shell command that reopens the conversation in its client."""
-    source, native_id, cwd = session["source"], session["native_id"], session["cwd"]
-    if source == "claude":
-        return f"cd {shlex.quote(cwd)} && claude --resume {native_id}" if cwd else f"claude --resume {native_id}"
-    if source == "codex":
-        return f"codex resume {native_id}"
-    if source == "cursor" and cwd:
-        return f"cursor {shlex.quote(cwd)}"
-    return None
+    resume = resume_argv(session)
+    if not resume:
+        return None
+    argv, cwd = resume
+    command = shlex.join(argv)
+    return f"cd {shlex.quote(cwd)} && {command}" if cwd else command
 
 
 def dir_warning(db: sqlite3.Connection, q: Query) -> str | None:

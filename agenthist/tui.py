@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 
 from . import markdown, store
-from .query import Query, dir_warning, search
+from .query import Query, dir_warning, resume_argv, search
 from .sources import index_all
 from .util import local, short_path
 
@@ -64,6 +64,7 @@ class TUI:
         self.scroll = 0
         self.status = ""
         self.error = ""
+        self.launch: tuple[list[str], str | None] | None = None  # set to quit and resume a session in its client
 
     # ---------------------------------------------------------------- state
 
@@ -105,7 +106,8 @@ class TUI:
 
     # ---------------------------------------------------------------- main loop
 
-    def run(self, screen) -> None:
+    def run(self, screen) -> tuple[list[str], str | None] | None:
+        """Returns the (argv, cwd) of a session to resume, if one was chosen."""
         self.screen = screen
         setup_colors()
         curses.curs_set(0)
@@ -113,12 +115,14 @@ class TUI:
         self.edit_filter(FILTERS[0])  # start in the search box, like fzf
 
         while True:
+            if self.launch:
+                return self.launch
             self.draw()
             key = screen.get_wch()
             session = self.selected_session()
 
             if key in ("q", "\x1b"):
-                return
+                return None
             elif key in FILTER_BY_HOTKEY:
                 self.edit_filter(FILTER_BY_HOTKEY[key])
             elif key in (curses.KEY_DOWN, "j"):
@@ -404,6 +408,12 @@ class TranscriptView:
             elif key == "N":
                 earlier = [i for i in self.match_lines if i < self.top]
                 self.top = earlier[-1] if earlier else self.top
+            elif key in ("\n", curses.KEY_ENTER):
+                resume = resume_argv(self.session)
+                if resume:
+                    self.tui.launch = resume
+                    return
+                self.tui.status = f"can't resume {self.session['source']} sessions"
             elif key == "y":
                 self.tui.copy(self.session["resume"] or self.session["path"])
 
@@ -425,7 +435,7 @@ class TranscriptView:
                     if match.end() > match.start():
                         tui.put(1 + row, match.start(), match.group(0), curses.color_pair(YELLOW) | curses.A_REVERSE)
 
-        footer = f"{self.top + 1}/{len(self.lines)}  ↑↓ pgup/pgdn g/G · n/N next/prev match · y copy resume · q back"
+        footer = f"{self.top + 1}/{len(self.lines)}  ↑↓ pgup/pgdn g/G · n/N next/prev match · enter resume · y copy resume · q back"
         tui.put(height - 1, 0, footer, curses.A_DIM)
         screen.refresh()
 
