@@ -5,10 +5,9 @@ prompt  Records a snapshot of the working tree (so the stop hook knows what this
 stop    The merge-ready gate. If this turn changed code and the scan finds something, the agent is sent back
         once with a short checklist; the next stop always goes through.
 
-The gate reads the turn's own transcript where it can, so it only asks about work this agent did: when
-another agent is editing the same checkout (an orchestrator waiting on a background Codex task, say),
-files the turn's tools never touched are left to that agent's own gate, and a CI command the agent
-already ran after its last edit isn't asked for again.
+The gate reads the turn's own transcript where it can, so it only asks about work this agent did: files
+the turn's tools never wrote (your edits, another agent's, a background task's) are left alone, and once
+the agent has run tests, a typecheck or a linter after its last edit, it isn't asked to run CI checks.
 
 Hooks must never break the agent: every failure is logged to hooks.log and the hook exits quietly.
 """
@@ -36,11 +35,29 @@ CONCURRENT_WINDOW = 6 * 3600   # a turn with no recorded stop counts as still ru
 IDLE_LIMIT = 15 * 60           # ...unless its transcript hasn't been written to for this long (killed, aborted)
 TRANSCRIPT_TAIL = 20 * 2**20   # bytes of transcript read at stop time
 
+# What a test has to earn its place: the user's standard, given up front when a request asks for tests and
+# applied at stop time to test files nobody asked for.
+TEST_STANDARD = ("A test should prove something real that reading the code doesn't: drive the broadest end-to-end "
+                 "path the change sits on (real inputs through the public entry point, not the helper you just wrote) "
+                 "and cover the edge cases that could actually break it: empty, missing and malformed input, "
+                 "boundaries, ordering and concurrency, failures from what it calls. Don't write tests that restate "
+                 "the implementation (asserting a constant, a mock's return value or the exact calls you just coded); "
+                 "prefer one strong scenario test over several of those.")
+
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 PATCH_FILE = re.compile(r"\*\*\* (?:Update|Add|Delete) File: (\S+)")
 # Shell commands that write files, and ones that hand work to another agent (whose edits aren't ours).
 SHELL_WRITE = re.compile(r"(?<![<>=&2-])>(?![&>]|\s*/dev/null)|\bsed -i|\bperl -\w*i|\btee\b|\.write\(|open\([^)]*['\"][wa]|"
                          r"\b(mv|cp|rm|touch|git (mv|rm|checkout|restore|apply))\b")
+# Commands that validate code: an agent that ran one of these after its last edit has already checked its work.
+VALIDATION = re.compile(
+    r"\b(tsc|biome|eslint|prettier --check|vitest|jest|mocha|playwright|cypress|deno (test|check|lint)|"
+    r"pytest|unittest|tox|nox|mypy|pyright|ruff|flake8|go (test|build|vet)|golangci-lint|staticcheck|"
+    r"cargo (test|check|build|clippy|nextest)|rspec|rubocop|phpunit|phpstan|mix (test|compile|credo)|"
+    r"gradlew?( \S+)* (test|check|build)|mvn( \S+)* (test|verify|package)|swift (test|build)|xcodebuild|"
+    r"dotnet (test|build)|flutter test|dart (test|analyze)|ctest|"
+    r"(make|just|task) (check|ci|verify|validate|lint|test)\w*|"
+    r"(pnpm|npm|yarn|bun)( run)? (test|check|typecheck|type-check|lint|verify|validate|ci)[\w:-]*)\b")
 DELEGATION = re.compile(r"codex-companion|\bcodex (exec|e)\b|\bclaude -p\b|\bcursor-agent\b")
 
 
@@ -115,11 +132,13 @@ def on_prompt(turn: Turn) -> dict | None:
     root = ready.repo_root(turn.cwd)
     if root:
         turn.save(root)
+    sections = []
+    if turn.prompt and ready.ASKS_FOR_TESTS.search(turn.prompt):
+        sections.append("How the user wants tests written: " + TEST_STANDARD)
     rules = cm_rules(turn.prompt, turn.cwd, PROMPT_RULE_LIMIT, proven_only=True) if turn.prompt else []
-    if not rules:
-        return prompt_output(turn.client, None)
-    text = "Rules from the user's playbook that apply to this request:\n" + "\n".join(f"- {r}" for r in rules)
-    return prompt_output(turn.client, text)
+    if rules:
+        sections.append("Rules from the user's playbook that apply to this request:\n" + "\n".join(f"- {r}" for r in rules))
+    return prompt_output(turn.client, "\n\n".join(sections) or None)
 
 
 def on_stop(turn: Turn) -> dict | None:
@@ -136,6 +155,7 @@ def on_stop(turn: Turn) -> dict | None:
     else:  # no snapshot (hook installed mid-session): fall back to uncommitted work
         files, prompt, since = ready.dirty_files(root), turn.prompt, None
     turn.notes["changed"] = len(files)
+    turn.notes["files"] = files[:20]  # for tuning the gate from hooks.log
     if not files:
         return None  # a question or a read-only turn: nothing to gate
 
@@ -143,17 +163,17 @@ def on_stop(turn: Turn) -> dict | None:
     if activity and not activity.calls:
         turn.notes["no_tool_calls"] = True
         return None  # the agent only talked: whatever changed was done by someone else (a subagent, the user)
-    others = concurrent_turns(turn, root, since) if since else []
-    if others and activity:
-        # Someone else is editing this checkout: only ask about files this turn's own tools wrote.
+    if activity:
+        # Only ask about files this turn's own tools wrote. The rest were changed by you, another agent or a
+        # background task, and aren't this agent's to justify.
         files = [path for path in files if activity.wrote(root, path)]
-        turn.notes.update(concurrent=others, own=len(files))
+        turn.notes.update(own=len(files), concurrent=concurrent_turns(turn, root, since))
         if not files:
             return None
 
     report = ready.scan(root, files=files, prompt=prompt)
-    if activity:
-        report.checks = [command for command in report.checks if not activity.ran_after_last_edit(command)]
+    if activity and activity.validated_after_last_edit():
+        report.checks = []  # it already ran tests, a typecheck or a linter on its final code
     rules = cm_rules(prompt or "", root, STOP_RULE_LIMIT) if prompt else []
     text = checklist(report, rules)
     turn.notes["items"] = sorted({f.kind for f in report.findings}) + (["checks"] if report.checks else [])
@@ -219,23 +239,12 @@ class Activity:
                 return True
         return False
 
-    def ran_after_last_edit(self, command: str) -> bool:
-        """Did the agent run this check command after its last file edit (by an edit tool or the shell)?"""
-        last_run = max((n for n, (_, text) in enumerate(self.calls) if command_ran(command, text)), default=-1)
+    def validated_after_last_edit(self) -> bool:
+        """Did the agent run any tests, typecheck or linter after its last file edit (by an edit tool or the shell)?
+        Targeted runs count: the gate asks for the CI command only when nothing checked the final code."""
+        last_run = max((n for n, (_, text) in enumerate(self.calls) if VALIDATION.search(text)), default=-1)
         return last_run >= 0 and not any(edited or (SHELL_WRITE.search(text) and not DELEGATION.search(text))
                                          for edited, text in self.calls[last_run + 1:])
-
-
-def command_ran(command: str, text: str) -> bool:
-    """Loose match, so `pnpm -C web check:all` and `cd frontend && (cd web && pnpm check:all)` count for
-    `cd frontend/web && CI=true pnpm check:all`."""
-    if command in text:
-        return True
-    directory, _, rest = command.rpartition(" && ")
-    script = rest.split()[-1] if rest.split() else rest
-    package = os.path.basename(directory[3:].strip().rstrip("/")) if directory.startswith("cd ") else ""
-    return bool(script) and re.search(rf"(?<![\w:-]){re.escape(script)}(?![\w:-])", text) is not None and \
-        (not package or package in text)
 
 
 def concurrent_turns(turn: Turn, root: str, since: str) -> list[str]:
@@ -289,7 +298,9 @@ def checklist(report: ready.Report, rules: list[str]) -> str | None:
                      + list_lines(comments))
     tests = report.by_kind("test-file")
     if tests:
-        items.append(f"New test/story files: {list_paths(tests)}. Keep them only if they were asked for or prove the change.")
+        items.append(f"New test files the request didn't ask for: {list_paths(tests)}. Keep one only if it "
+                     "proves something beyond what you just wrote; otherwise delete it, or rework it into that. "
+                     + TEST_STANDARD)
     debug = report.by_kind("debug")
     if debug:
         items.append("Debug output left in: " + list_lines(debug))
@@ -301,9 +312,12 @@ def checklist(report: ready.Report, rules: list[str]) -> str | None:
 
     if report.checks:
         commands = " and ".join(f"`{command}`" for command in report.checks)
-        items.append(f"Checks: run {commands} (what CI runs) and report the result, or say why you didn't.")
+        items.append(f"Checks: nothing validated your final edits. If they could fail CI, run {commands} (or just the "
+                     "tests and typecheck for the files you touched) and report the result. If they can't (copy, styling, "
+                     "comments, a file that check doesn't cover), skip it and say why in one line.")
 
-    lines = ["Before finishing, go through these and address each in your final message (fix it, or say why it stays):"]
+    lines = ["Before finishing, go through these and address each in your final message (fix it, or say why it stays). "
+             "These are prompts, not orders: skipping one with a reason is fine, extra busywork isn't."]
     lines += [f"{n}. {item}" for n, item in enumerate(items, 1)]
     if rules:
         lines.append("From the user's playbook (cm):")

@@ -131,9 +131,21 @@ When an agent finishes a turn that changed code, it is sent back **once** with a
 goes through. Turns that changed nothing (questions, reviews) are never interrupted.
 
 - **Scope**: files changed this turn that the request didn't name (only when it named real paths).
-- **Narrating comments** (`// Now we…`, `# Added…`), **new test/story files**, **debug output**, **TODO/FIXME**.
-- **Checks**: the command CI runs for those files (nearest `package.json` with `check:all`, or your own map in
-  `~/.config/agent-history/checks.json`: `{"checks": [{"repo": "monorepo", "paths": "backend/*", "command": "..."}]}`).
+- **Narrating comments** (`// Now we…`, `# Added…`), **new test files** nobody asked for (held to "prove something
+  beyond what you just wrote"), **debug output**, **TODO/FIXME**.
+- **Checks**: only when nothing validated the agent's final edits. It names the command for the nearest project
+  around the changed code files:
+
+  | project | command |
+  |---|---|
+  | `Makefile` / `justfile` | the `check`, `ci`, `verify` or `validate` target, else `lint` and `test` |
+  | `package.json` | the `check:all`, `check`, `ci`, `verify` or `validate` script, else `typecheck`, `lint` and `test`; run with pnpm, yarn, bun or npm per the lockfile |
+  | `go.mod` | `go vet` and `go test` on the changed packages |
+  | `Cargo.toml` | `cargo test` |
+  | `pyproject.toml` | `pytest`, plus `ruff`/`mypy` when configured; via `uv run` or `poetry run` when they manage the project |
+
+  Override it per repo in `~/.config/agent-history/checks.json`:
+  `{"checks": [{"repo": "my-repo", "paths": "backend/*", "command": "make backend-ci"}]}`.
 - **Your rules**: the most relevant entries from your `cm` playbook (see below), if any.
 
 ```sh

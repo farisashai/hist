@@ -16,12 +16,22 @@ from .util import HOME
 
 CONFIG_PATH = os.path.join(HOME, ".config", "agent-history", "checks.json")
 
-CODE_EXTENSIONS = {".go", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rs", ".java", ".kt", ".swift",
-                   ".rb", ".sh", ".sql", ".proto", ".css", ".scss", ".yaml", ".yml", ".toml", ".tf", ".rego"}
-HASH_COMMENT_EXTENSIONS = {".py", ".sh", ".rb", ".yaml", ".yml", ".toml", ".tf", ".rego"}
+CODE_EXTENSIONS = {".go", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro",
+                   ".py", ".rs", ".java", ".kt", ".kts", ".scala", ".swift", ".m", ".mm", ".c", ".h", ".cc", ".cpp",
+                   ".hpp", ".cs", ".fs", ".rb", ".php", ".ex", ".exs", ".erl", ".dart", ".lua", ".hs", ".ml", ".zig",
+                   ".clj", ".jl", ".r", ".pl", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".sql", ".proto", ".graphql",
+                   ".css", ".scss", ".sass", ".less", ".yaml", ".yml", ".toml", ".tf", ".hcl", ".nix", ".rego"}
+# Files a CI check can fail on: code plus the JSON config next to it (package.json, tsconfig.json). Docs, copy
+# and images never need a check run.
+CHECKED_EXTENSIONS = CODE_EXTENSIONS | {".json"}
+HASH_COMMENT_EXTENSIONS = {".py", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".rb", ".ex", ".exs", ".r", ".pl", ".jl",
+                           ".nix", ".yaml", ".yml", ".toml", ".tf", ".hcl", ".rego", ".graphql"}
+DASH_COMMENT_EXTENSIONS = {".sql", ".lua", ".hs"}
 
-TEST_FILE = re.compile(r"(\.test\.|\.spec\.|_test\.go$|\.stories\.|(^|/)__tests__/|(^|/)tests?/)")
-DEBUG_LINE = re.compile(r"\bconsole\.(log|debug)\(|\bdebugger;|\bbreakpoint\(\)|pdb\.set_trace\(|\bdbg!\(")
+TEST_FILE = re.compile(r"(\.test\.|\.spec\.|\.stories\.|_test\.\w+$|_spec\.rb$|(^|/)test_[^/]+\.py$|"
+                       r"Tests?\.(java|kt|swift|cs|scala)$|(^|/)(__tests__|tests?|spec)/)")
+DEBUG_LINE = re.compile(r"\bconsole\.(log|debug|trace|dir)\(|\bdebugger;|\bbreakpoint\(\)|i?pdb\.set_trace\(|\bdbg!\(|"
+                        r"\bbinding\.pry\b|\bbyebug\b|\bvar_dump\(|\bIO\.inspect\(")
 TODO_LINE = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
 # Comments that narrate the edit instead of explaining the code ("// Now we fetch…", "# Added helper…").
 NARRATION = re.compile(
@@ -31,7 +41,9 @@ NARRATION = re.compile(
 # The request asks for tests itself, so new test files are expected rather than suspicious.
 ASKS_FOR_TESTS = re.compile(r"\b(add|write|cover|create|with|include|new|missing|regression)\b[^.\n]{0,40}"
                             r"\b(tests?|specs?|stor(y|ies))\b|\b(tests?|specs?|stories) for\b|\bcoverage\b|\btdd\b", re.I)
-TEST_SUFFIX = re.compile(r"([._](test|spec|stories))(?=\.[^.]+$)|_test(?=\.go$)")
+# What to strip from a test file's name to get the file it tests: a.test.ts, a_test.go, a_spec.rb, test_a.py, ATest.java.
+TEST_SUFFIX = re.compile(r"[._](test|spec|stories)(?=\.[^.]+$)|(?<=/)test_(?=[^/]+\.py$)|^test_(?=[^/]+\.py$)|"
+                         r"Tests?(?=\.(java|kt|swift|cs|scala)$)")
 PATH_TOKEN = re.compile(r"(?<![\w./-])((?:[\w@.-]+/)*[\w@.-]+\.[A-Za-z]{1,6}|(?:[\w@.-]+/)+[\w@.-]*)(?::\d+)?")
 
 
@@ -272,6 +284,8 @@ def comment_body(path: str, line: str) -> str | None:
             return stripped[len(marker):].strip()
     if extension in HASH_COMMENT_EXTENSIONS and stripped.startswith("#") and not stripped.startswith("#!"):
         return stripped[1:].strip()
+    if extension in DASH_COMMENT_EXTENSIONS and stripped.startswith("--"):
+        return stripped[2:].strip()
     return None
 
 
@@ -308,8 +322,9 @@ def matches_named(path: str, named: str) -> bool:
 # ---------------------------------------------------------------- CI commands
 
 def check_commands(root: str, files: list[str]) -> list[str]:
-    """The command(s) CI runs for these files: from ~/.config/agent-history/checks.json if it matches,
-    else the nearest package.json with a check:all script."""
+    """The command(s) CI would run for these files: from ~/.config/agent-history/checks.json if a rule matches,
+    else what the nearest project defines (package.json scripts, a Makefile or justfile target, go.mod,
+    Cargo.toml or pyproject.toml)."""
     commands = []
     for rule in load_check_config():
         if os.path.basename(root) == rule.get("repo", os.path.basename(root)) and \
@@ -318,13 +333,133 @@ def check_commands(root: str, files: list[str]) -> list[str]:
     if commands:
         return list(dict.fromkeys(commands))
 
-    for package_dir in sorted({nearest_package_dir(root, path) for path in files} - {None}):
-        scripts = read_scripts(os.path.join(root, package_dir, "package.json"))
-        script = next((name for name in ("check:all", "check") if name in scripts), None)
-        if script:
-            prefix = f"cd {package_dir} && " if package_dir != "." else ""
-            commands.append(f"{prefix}CI=true pnpm {script}")
-    return commands
+    go_packages: dict[str, set[str]] = {}  # go.mod dir -> changed package dirs, to scope `go test`
+    for path in files:
+        if os.path.splitext(path)[1] not in CHECKED_EXTENSIONS:
+            continue
+        found = project_check(root, path)
+        if not found:
+            continue
+        directory, command = found
+        if command == "go":
+            package = os.path.relpath(os.path.dirname(path), directory) if directory != "." else os.path.dirname(path)
+            go_packages.setdefault(directory, set()).add("./..." if package in ("", ".") else f"./{package}/...")
+        else:
+            commands.append(in_dir(directory, command))
+    for directory, packages in sorted(go_packages.items()):
+        targets = "./..." if "./..." in packages else " ".join(sorted(packages))
+        commands.append(in_dir(directory, f"go vet {targets} && go test {targets}"))
+    return list(dict.fromkeys(commands))
+
+
+def in_dir(directory: str, command: str) -> str:
+    return command if directory == "." else f"cd {directory} && {command}"
+
+
+def project_check(root: str, path: str) -> tuple[str, str] | None:
+    """(directory, command) from the nearest project around `path` that defines a check for it."""
+    extension = os.path.splitext(path)[1]
+    directory = os.path.dirname(path)
+    while True:
+        here = os.path.join(root, directory)
+        command = (task_target(here)
+                   or (extension not in (".go", ".rs", ".py") and package_check(root, directory or ".", path))
+                   or (extension == ".go" and os.path.exists(os.path.join(here, "go.mod")) and "go")
+                   or (extension == ".rs" and os.path.exists(os.path.join(here, "Cargo.toml")) and "cargo test")
+                   or (extension == ".py" and python_check(here)))
+        if command:
+            return directory or ".", command
+        if not directory:
+            return None
+        directory = os.path.dirname(directory)
+
+
+# Script and target names that mean "everything CI checks", most specific first.
+AGGREGATE_SCRIPTS = ("check:all", "check", "ci", "verify", "validate")
+PARTIAL_SCRIPTS = (("typecheck", "type-check", "check:types", "tsc"), ("lint",), ("test",))
+
+
+def package_check(root: str, directory: str, path: str) -> str | None:
+    scripts = read_scripts(os.path.join(root, directory, "package.json"))
+    if not scripts:
+        return None
+    runner = package_runner(root, directory)
+    aggregate = next((name for name in AGGREGATE_SCRIPTS if name in scripts), None)
+    if aggregate:
+        return f"CI=true {runner} {aggregate}" if covers(scripts[aggregate], directory, path) else None
+    # No single check script: run the typecheck, lint and test scripts the package does have.
+    partial = [next(name for name in names if name in scripts) for names in PARTIAL_SCRIPTS
+               if any(name in scripts for name in names)]
+    return " && ".join(f"CI=true {runner} {name}" for name in partial) or None
+
+
+def task_target(directory: str) -> str | None:
+    """`make check` / `just check` (or ci, verify, validate; else lint and test) when the directory defines them."""
+    for filename, tool in (("Makefile", "make"), ("makefile", "make"), ("GNUmakefile", "make"), ("justfile", "just"),
+                           ("Justfile", "just")):
+        try:
+            with open(os.path.join(directory, filename), errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        defined = [target for target in ("check", "ci", "verify", "validate", "lint", "test")
+                   if re.search(rf"^{target}\s*:", text, re.M)
+                   or (tool == "just" and re.search(rf"^{target}\b[^:\n]*:", text, re.M))]
+        aggregate = next((target for target in defined if target not in ("lint", "test")), None)
+        if aggregate:
+            return f"{tool} {aggregate}"
+        if defined:
+            return " && ".join(f"{tool} {target}" for target in defined)
+    return None
+
+
+def python_check(directory: str) -> str | None:
+    """pytest plus the linters and type checker pyproject.toml configures, via uv or poetry when they manage it."""
+    try:
+        with open(os.path.join(directory, "pyproject.toml"), errors="replace") as f:
+            pyproject = f.read()
+    except OSError:
+        pyproject = None
+    has_tests = any(os.path.exists(os.path.join(directory, name)) for name in ("tests", "test", "pytest.ini", "conftest.py"))
+    if pyproject is None and not has_tests:
+        return None
+    run = "uv run " if os.path.exists(os.path.join(directory, "uv.lock")) else \
+        "poetry run " if os.path.exists(os.path.join(directory, "poetry.lock")) else ""
+    steps = []
+    if pyproject and "[tool.ruff" in pyproject:
+        steps.append("ruff check .")
+    if pyproject and "[tool.mypy" in pyproject:
+        steps.append("mypy .")
+    if has_tests or (pyproject and "[tool.pytest" in pyproject):
+        steps.append("pytest")
+    return " && ".join(run + step for step in steps) or None
+
+
+LOCKFILES = (("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lock", "bun run"), ("bun.lockb", "bun run"),
+             ("package-lock.json", "npm run"))
+
+
+def package_runner(root: str, package_dir: str) -> str:
+    """How to run a package.json script here, from the nearest lockfile (workspaces keep it at the top)."""
+    directory = package_dir
+    while True:
+        for lockfile, runner in LOCKFILES:
+            if os.path.exists(os.path.join(root, directory, lockfile)):
+                return runner
+        if directory in ("", "."):
+            return "npm run"
+        directory = os.path.dirname(directory)
+
+
+def covers(script: str, package_dir: str, path: str) -> bool:
+    """Whether a workspace-level check script reaches `path`. A script that only runs `pnpm --filter <pkg> …`
+    covers just those packages, so a file in a sibling package without its own package.json isn't checked."""
+    filters = re.findall(r"--filter[= ]['\"]?([\w@./-]+)", script)
+    if not filters:
+        return True
+    inside = os.path.relpath(path, package_dir) if package_dir != "." else path
+    top = inside.split("/")[0]
+    return any(name.split("/")[-1].rstrip(".") == top for name in filters)
 
 
 def load_check_config() -> list[dict]:
@@ -333,16 +468,6 @@ def load_check_config() -> list[dict]:
             return json.load(f).get("checks", [])
     except (OSError, ValueError):
         return []
-
-
-def nearest_package_dir(root: str, path: str) -> str | None:
-    directory = os.path.dirname(path)
-    while True:
-        if os.path.exists(os.path.join(root, directory, "package.json")):
-            return directory or "."
-        if not directory:
-            return None
-        directory = os.path.dirname(directory)
 
 
 def read_scripts(package_json: str) -> dict:
