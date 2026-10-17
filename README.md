@@ -1,7 +1,85 @@
-# hist — search all local AI agent sessions
+# hist — search all your past agent conversations
 
-One stdlib-only Python script (`./hist`) that indexes every local agent conversation into
-`~/.cache/agent-history/index.db` (SQLite) and lets humans (TUI) and agents (CLI + JSON) search it.
+A tiny terminal UI for finding that conversation you had with an agent last week. It scans every Claude Code,
+Claude desktop, Codex and Cursor session already on your disk, so you can type a few keywords, watch results
+narrow as you type, read the transcript, and press enter to jump back into it in the original client.
+
+- **Fully local.** hist reads the transcript files the clients already wrote to your disk and keeps its own SQLite
+  index in `~/.cache/agent-history/index.db`. It has no server, account or telemetry, and it makes no network
+  requests, so none of your conversations leave your machine. (The one opt-in exception is `hist summarize`, below.)
+- **Agent friendly.** Every command takes `--json` (JSON on stdout, progress on stderr, stable exit codes), and
+  `hist help` documents each flag with examples. An agent can search your past sessions and read the relevant
+  messages the same way you do in the TUI. See [For agents](#for-agents).
+- **No dependencies.** It's a Python standard-library package (`./hist`), so there's nothing to `pip install`.
+
+### What stays on your machine
+
+| | reads | writes | network |
+|---|---|---|---|
+| `hist`, `search`, `show`, `dirs`, `sources`, `index`, `annotate` | client transcripts on disk | `~/.cache/agent-history/` | none |
+| `enter` in the TUI | – | – | none from hist; it launches the client you resume, which talks to its own service as usual |
+| `hist summarize` (opt-in, only when you run it) | the selected transcripts | titles/summaries into the index | **sends condensed transcripts to `claude -p`** (or the command in `$HIST_SUMMARIZER`); point it at a local model to stay offline |
+| `ready`, `install-hooks`, hooks | your git repo, client configs | hook entries in client configs, `~/.cache/agent-history/` | none from hist; if you've installed [`cm`](#companion-tools-not-reimplemented-here), the hooks call it, and it follows its own settings |
+
+hist never modifies the clients' conversation data. `install-hooks` is the only command that edits their
+configuration files, and it backs them up first.
+
+## Install and run
+
+Needs macOS (it reads each client's macOS data locations) and Python 3.9+; nothing to `pip install`.
+
+**Run it straight from the checkout:**
+
+```sh
+git clone https://github.com/farisashai/hist.git && cd hist
+./hist                      # or: python3 -m agenthist
+```
+
+**Install it as `hist` on your PATH** by symlinking the launcher (it resolves the symlink to find the package,
+so keep the checkout where it is):
+
+```sh
+mkdir -p ~/.local/bin
+ln -s "$PWD/hist" ~/.local/bin/hist
+# if ~/.local/bin isn't on your PATH yet:
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+```
+
+**Use it:**
+
+```sh
+hist                        # opens the TUI; the first run indexes everything (a few seconds), later runs ~0.2s
+hist -d . --since 7d        # open pre-filtered to this directory and the last week
+hist help                   # every command, for scripting and agents
+```
+
+To update, `git pull` in the checkout. To uninstall, remove the symlink and the index
+(`rm ~/.local/bin/hist && rm -r ~/.cache/agent-history`), plus `hist install-hooks --uninstall` if you installed
+the hooks. Searching only reads the clients' data; it never modifies it.
+
+## TUI
+
+Opens fzf-style in the search box: results and the preview pane update as you type. Matching is
+case-insensitive substring search over message text, so a word or two from the conversation is usually enough;
+press `r` for a regex instead.
+
+- **While typing**: `↑↓` select, `enter` opens the transcript at the first match, `tab` drops to the list,
+  `esc` clears the search.
+- **In the list**: `/` text, `r` regex, `d` dir (`.` = cwd), `s`/`u` since/until (`3d`, `12h`, `2026-10-01`),
+  `x` source, `t` include tool calls, `a` subagents, `c` clear, `R` re-index, `y` copy resume command,
+  `p` copy transcript path, `q` quit.
+- **In a transcript**: rendered as Markdown with matches highlighted; `n`/`N` next/prev match, `g`/`G` top/bottom,
+  `y` copy resume command, `q` back, and **`enter` resumes the conversation**: hist exits and runs the client's
+  own command in the session's directory:
+
+  | source | enter runs |
+  |---|---|
+  | `claude` | `claude --resume <id>` |
+  | `codex` | `codex resume <id>` |
+  | `cursor` | `cursor-agent --resume <id>`, or opens the workspace in Cursor if the CLI agent isn't installed |
+  | `claude-desktop` | not resumable from a terminal |
+
+## What it reads
 
 | source           | where it reads from |
 |------------------|---------------------|
@@ -13,6 +91,16 @@ One stdlib-only Python script (`./hist`) that indexes every local agent conversa
 Each query does a quick incremental re-index (~0.1–0.3s); `--no-index` skips it, `hist index --full` rebuilds.
 
 ## For agents
+
+hist is meant to be run by agents as well as people. It's a local CLI, so an agent with a shell can use it with no
+MCP server, API key or network access. Tell your agent something like *"use `hist` to find how we fixed this
+before"* and it can discover the commands with `hist help`. The output is designed for that use:
+
+- `--json` on every command: JSONL results on stdout; progress and notes go only to stderr.
+- Small, targeted reads: search returns matching snippets (`hits_preview`), and `show` can read just
+  `--grep` matches, a `--range` of messages, or the `--tail`, with `--max-chars` capping each message.
+- Ids resolve by unique prefix, and errors come back as JSON with a hint, such as the candidates for an
+  ambiguous id.
 
 ```sh
 hist search -q "rate limit" -d ~/src/app --since 7d --json   # JSONL, one session per line, matching messages in hits_preview
@@ -85,13 +173,6 @@ Codex asks you to approve new hooks once; Cursor reads `~/.cursor/hooks.json` af
 - **Orchestrator → executor**: [`codex-plugin-cc`](https://github.com/openai/codex-plugin-cc) lets Claude Code delegate
   to Codex (`/codex:rescue --background <task>`, `/codex:review`). It uses `~/.codex/config.toml`, so delegated work
   runs on your default Codex model and service tier.
-
-## TUI
-
-`hist` (or `hist -d . --since 7d` to pre-filter). Opens fzf-style in the search box: results and the preview
-pane update as you type; `↑↓` select while typing, `enter` opens the transcript at the first match (`n`/`N` next/prev
-match), `tab` drops to the list. In the list: `/` text, `r` regex, `d` dir (`.` = cwd), `s`/`u` since/until,
-`x` source, `t` include tools, `a` subagents, `c` clear, `R` re-index, `y` copy resume command, `q` quit.
 
 ## Not covered
 - Plain ChatGPT chats and claude.ai chats live server-side, not on disk.
