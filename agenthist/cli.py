@@ -150,9 +150,10 @@ def cmd_index(db, args: dict) -> None:
 
 def cmd_tui(db, args: dict) -> None:
     import curses
-    from .tui import TUI
+    from .tui import TUI, avoid_broken_rep
 
     os.environ.setdefault("ESCDELAY", "25")  # make esc respond immediately
+    avoid_broken_rep()
     curses.wrapper(TUI(db, args).run)
 
 

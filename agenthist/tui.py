@@ -13,7 +13,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 
-from . import store
+from . import markdown, store
 from .query import Query, dir_warning, search
 from .sources import index_all
 from .util import local, short_path
@@ -352,7 +352,10 @@ class TranscriptView:
         self.top = self.match_lines[0] if self.match_lines else 0
 
     def layout(self, messages: list[tuple], width: int) -> tuple[list[tuple], list[int]]:
-        """[(text, attr, highlight?)] wrapped to width, plus the line numbers of matching messages' headers."""
+        """[(spans, highlight?)] wrapped to width, plus the line numbers of matching messages' headers.
+
+        spans is [(text, attr)]; user and assistant messages are rendered as Markdown, tool output as plain text.
+        """
         role_colors = {"user": GREEN, "assistant": CYAN, "tool": MAGENTA}
         lines, match_lines = [], []
         for _, ts, role, text in messages:
@@ -360,13 +363,16 @@ class TranscriptView:
             if is_match:
                 match_lines.append(len(lines))
             header = f"── {role} · {local(ts)}" + ("  ◀ match" if is_match else "")
-            lines.append((header, curses.color_pair(role_colors.get(role, 0)) | curses.A_BOLD, False))
+            lines.append(([(header, curses.color_pair(role_colors.get(role, 0)) | curses.A_BOLD)], False))
 
-            body = text if role != "tool" else text[:800]
-            for paragraph in body.split("\n"):
-                for line in textwrap.wrap(paragraph, width - 2) or [""]:
-                    lines.append((line, 0, True))
-            lines.append(("", 0, False))
+            if role == "tool":
+                for paragraph in text[:800].split("\n"):
+                    for line in textwrap.wrap(paragraph, width - 2) or [""]:
+                        lines.append(([(line, 0)], True))
+            else:
+                for line in markdown.render(text, width - 2):
+                    lines.append(([(t, style_attr(styles)) for t, styles in line if t], True))
+            lines.append(([], False))
         return lines, match_lines
 
     def run(self) -> None:
@@ -408,9 +414,13 @@ class TranscriptView:
         tui.put(0, 0, f"{self.session['title'] or '(untitled)'} — {short_path(self.session['cwd'])}",
                 curses.A_BOLD | curses.A_REVERSE)
 
-        for row, (text, attr, highlight) in enumerate(self.lines[self.top:self.top + height - 2]):
-            tui.put(1 + row, 0, text, attr)
+        for row, (spans, highlight) in enumerate(self.lines[self.top:self.top + height - 2]):
+            x = 0
+            for text, attr in spans:
+                tui.put(1 + row, x, text, attr)
+                x += len(text)
             if highlight and self.hit_pattern:
+                text = "".join(t for t, _ in spans)
                 for match in self.hit_pattern.finditer(text):
                     if match.end() > match.start():
                         tui.put(1 + row, match.start(), match.group(0), curses.color_pair(YELLOW) | curses.A_REVERSE)
@@ -420,11 +430,43 @@ class TranscriptView:
         screen.refresh()
 
 
+def avoid_broken_rep() -> None:
+    """Old ncurses (macOS ships 6.0) garbles the terminal's repeat-character command for multibyte characters,
+    so runs like ──── in table borders vanish and stale screen content shows through. Fall back to a terminal
+    type without that command."""
+    if curses.ncurses_version >= (6, 1):
+        return
+    try:
+        curses.setupterm()
+        if curses.tigetstr("rep"):
+            os.environ["TERM"] = "xterm-256color"
+    except curses.error:
+        pass
+
+
 def setup_colors() -> None:
     curses.use_default_colors()
     for pair, color in ((CYAN, curses.COLOR_CYAN), (YELLOW, curses.COLOR_YELLOW), (GREEN, curses.COLOR_GREEN),
                         (MAGENTA, curses.COLOR_MAGENTA), (RED, curses.COLOR_RED)):
         curses.init_pair(pair, color, -1)
+
+
+def style_attr(styles: frozenset) -> int:
+    """Curses attributes for a set of markdown span styles."""
+    attr = 0
+    if "bold" in styles:
+        attr |= curses.A_BOLD
+    if "italic" in styles:
+        attr |= getattr(curses, "A_ITALIC", curses.A_UNDERLINE)
+    if "code" in styles:
+        attr |= curses.color_pair(YELLOW)
+    if "link" in styles:
+        attr |= curses.color_pair(CYAN) | curses.A_UNDERLINE
+    if "heading" in styles:
+        attr |= curses.color_pair(MAGENTA) | curses.A_BOLD
+    if "dim" in styles:
+        attr |= curses.A_DIM
+    return attr
 
 
 def is_partial_time(value: str) -> bool:
