@@ -1,7 +1,7 @@
 """Finds every client's sessions on disk and keeps the index in sync with them.
 
 Each client module exposes `index(db, paths, full) -> int` (number of sessions re-parsed).
-File-based clients (Claude, Codex) share `index_files`; Cursor reads its own SQLite database.
+File-based clients (Claude, Codex) share `index_files`; Cursor and Devin read the apps' SQLite databases.
 """
 from __future__ import annotations
 
@@ -11,11 +11,12 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable
+from urllib.parse import quote
 
 from .. import store
 from ..util import HOME
 
-SOURCES = ("claude", "claude-desktop", "codex", "cursor")
+SOURCES = ("claude", "claude-desktop", "codex", "cursor", "devin")
 
 # Cap on stored text, so one pasted log or tool dump can't dominate the index.
 TEXT_LIMIT = 20_000
@@ -31,6 +32,8 @@ class Paths:
     cursor_state_db: str
     cursor_workspaces: str
     cursor_projects: str
+    devin_messages: str
+    devin_state_db: str
 
     @classmethod
     def for_home(cls, home: str = HOME) -> "Paths":
@@ -42,16 +45,18 @@ class Paths:
             cursor_state_db=os.path.join(app_support, "Cursor", "User", "globalStorage", "state.vscdb"),
             cursor_workspaces=os.path.join(app_support, "Cursor", "User", "workspaceStorage"),
             cursor_projects=os.path.join(home, ".cursor", "projects"),
+            devin_messages=os.path.join(app_support, "Devin", "User", "acp-messages"),
+            devin_state_db=os.path.join(app_support, "Devin", "User", "globalStorage", "state.vscdb"),
         )
 
 
 def index_all(db: sqlite3.Connection, full: bool = False, quiet: bool = False, paths: Paths | None = None) -> None:
     """Bring the index up to date. Incremental unless full=True."""
-    from . import claude, codex, cursor  # local import: the client modules import helpers from this package
+    from . import claude, codex, cursor, devin  # local import: the client modules import helpers from this package
 
     paths = paths or Paths.for_home()
     started = time.time()
-    for name, module in (("claude", claude), ("codex", codex), ("cursor", cursor)):
+    for name, module in (("claude", claude), ("codex", codex), ("cursor", cursor), ("devin", devin)):
         try:
             updated = module.index(db, paths, full)
         except Exception as e:  # one client's unreadable data must not block searching the others
@@ -65,6 +70,21 @@ def index_all(db: sqlite3.Connection, full: bool = False, quiet: bool = False, p
     db.commit()
     if not quiet:
         print(f"index ready in {time.time() - started:.1f}s → {store.DB_PATH}", file=sys.stderr)
+
+
+def open_readonly(path: str, probe: str) -> sqlite3.Connection:
+    """Open an app's SQLite database without writing to it.
+
+    The apps use WAL mode, and while they aren't running the -wal/-shm files are gone; a read-only connection
+    can't recreate them and fails with "unable to open database file". Then nothing is mid-write, so the
+    file can safely be read as immutable. `probe` is a query that fails if the connection can't read."""
+    uri = f"file:{quote(path)}"
+    try:
+        connection = sqlite3.connect(f"{uri}?mode=ro", uri=True)
+        connection.execute(probe)
+        return connection
+    except sqlite3.OperationalError:
+        return sqlite3.connect(f"{uri}?immutable=1", uri=True)
 
 
 def index_files(db: sqlite3.Connection, files: Iterable[str], parse: Callable[[str], store.Session], full: bool) -> int:

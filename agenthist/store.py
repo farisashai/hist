@@ -68,9 +68,9 @@ def _sql_regexp(pattern: str, text: str | None) -> int:
 class Session:
     """One conversation as parsed from a client, before it is written to the index."""
     id: str             # "<source>:<native_id>", unique across clients
-    source: str         # claude | claude-desktop | codex | cursor
+    source: str         # claude | claude-desktop | codex | cursor | devin
     native_id: str      # the client's own id (what `claude --resume` / `codex resume` take)
-    path: str           # transcript file (or Cursor's state DB)
+    path: str           # transcript file (or Cursor's state DB, or Devin's per-session cache DB)
     cwd: str | None = None
     title: str | None = None
     branch: str | None = None

@@ -33,12 +33,12 @@ FILTERS = [
     Filter("dir", "Dir", "d", "path; . = cwd"),
     Filter("since", "Since", "s", "2026-10-01, 3d, 12h, today"),
     Filter("until", "Until", "u", "date or 2d"),
-    Filter("source", "Source", "x", "claude,claude-desktop,codex,cursor"),
+    Filter("source", "Source", "x", "claude,claude-desktop,codex,cursor,devin"),
 ]
 FILTER_BY_HOTKEY = {f.hotkey: f for f in FILTERS}
 LIVE_FILTERS = ("query", "regex")  # filters that search on every keystroke
 
-SOURCE_BADGES = {"claude": "CC", "claude-desktop": "CD", "codex": "CX", "cursor": "CU"}
+SOURCE_BADGES = {"claude": "CC", "claude-desktop": "CD", "codex": "CX", "cursor": "CU", "devin": "DV"}
 RESULT_LIMIT = 300
 DEBOUNCE_MS = 90
 

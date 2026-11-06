@@ -1,7 +1,7 @@
 # hist — search all your past agent conversations
 
 A tiny terminal UI for finding that conversation you had with an agent last week. It scans every Claude Code,
-Claude desktop, Codex and Cursor session already on your disk, so you can type a few keywords, watch results
+Claude desktop, Codex, Cursor and Devin session already on your disk, so you can type a few keywords, watch results
 narrow as you type, read the transcript, and press enter to jump back into it in the original client.
 
 - **Fully local.** hist reads the transcript files the clients already wrote to your disk and keeps its own SQLite
@@ -77,6 +77,7 @@ press `r` for a regex instead.
   | `claude` | `claude --resume <id>` |
   | `codex` | `codex resume <id>` |
   | `cursor` | `cursor-agent --resume <id>`, or opens the workspace in Cursor if the CLI agent isn't installed |
+  | `devin` | `open devin://session/<id>`, which opens the session in the Devin desktop app |
   | `claude-desktop` | not resumable from a terminal |
 
 ## What it reads
@@ -87,6 +88,12 @@ press `r` for a regex instead.
 | `claude-desktop` | `~/Library/Application Support/Claude/local-agent-mode-sessions/**` (Cowork) + desktop session titles |
 | `codex`          | `~/.codex/sessions`, `~/.codex/archived_sessions` (Codex CLI, ChatGPT/Codex desktop app, IDE ext) + thread titles from `state_5.sqlite` |
 | `cursor`         | Cursor `state.vscdb` composers/bubbles (IDE agent + background agents), `~/.cursor/projects/*/agent-transcripts` |
+| `devin`          | the Devin desktop app's session cache, `~/Library/Application Support/Devin/User/acp-messages/*.db` (cloud sessions you've opened in the app, and local Devin CLI sessions run in it) |
+
+Devin cloud sessions run on Devin's VMs, so hist sets their directory to your own checkout of the session's
+repo (the one your other agents ran in most), which makes `-d` and `hist dirs` work for them; their summary
+lists the PRs they opened. Codex and Claude Code sessions run inside the Devin app are read from their own
+transcripts instead, so they aren't listed twice.
 
 Each query does a quick incremental re-index (~0.1–0.3s); `--no-index` skips it, `hist index --full` rebuilds.
 
@@ -188,6 +195,9 @@ Codex asks you to approve new hooks once; Cursor reads `~/.cursor/hooks.json` af
 
 ## Not covered
 - Plain ChatGPT chats and claude.ai chats live server-side, not on disk.
+- Devin cloud sessions you've never opened in the Devin desktop app (e.g. ones only seen in Slack or the web app)
+  aren't cached locally. Devin's thoughts aren't indexed (like other clients' reasoning), nor is streamed terminal
+  output, which the cache keeps only as a compressed blob; each command's final output is.
 - Cursor background-agent details cached as protobuf (`bcCachedDetails`) aren't decoded; their conversations show
   up through the regular composer records when synced.
 
@@ -201,7 +211,7 @@ Python 3.9+ standard library only. `./hist` is a small launcher (safe to symlink
 | `tui.py` | curses UI: filter bar, live search box (`LineEditor`), result list, `TranscriptView` |
 | `query.py` | `Query` (validated filters → SQL), `search`, directory and source listings |
 | `store.py` | SQLite schema, `Session` record, writing/reading sessions, annotations |
-| `sources/` | one parser per client (`claude.py`, `codex.py`, `cursor.py`) plus the incremental indexing driver |
+| `sources/` | one parser per client (`claude.py`, `codex.py`, `cursor.py`, `devin.py`) plus the incremental indexing driver |
 | `summarize.py` | on-demand LLM titles/summaries |
 | `util.py` | errors, timestamps, text cleanup, display formatting |
 

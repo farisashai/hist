@@ -241,6 +241,8 @@ def resume_argv(session: dict) -> tuple[list[str], str | None] | None:
             return [agent, "--resume", native_id], cwd
         if cwd:  # no CLI agent: open the workspace in the IDE, where the chat lives
             return (["cursor", cwd] if shutil.which("cursor") else ["open", "-a", "Cursor", cwd]), None
+    if source == "devin" and re.fullmatch(r"[0-9a-f]{32}", native_id or ""):
+        return ["open", f"devin://session/{native_id}"], None  # opens the session in the Devin desktop app
     return None
 
 

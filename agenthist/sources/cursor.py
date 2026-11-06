@@ -14,12 +14,12 @@ import json
 import os
 import re
 import sqlite3
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 from .. import store
 from ..store import Session
 from ..util import cap, iso
-from . import TEXT_LIMIT, TOOL_LIMIT, Paths
+from . import TEXT_LIMIT, TOOL_LIMIT, Paths, open_readonly
 
 USER_BUBBLE = 1
 
@@ -67,18 +67,7 @@ def index_composers(db, paths: Paths, full: bool) -> tuple[set[str], int]:
 
 
 def open_state_db(path: str) -> sqlite3.Connection:
-    """Open Cursor's state DB without writing to it.
-
-    It is in WAL mode, and when Cursor isn't running its -wal/-shm files are gone; a read-only connection
-    can't recreate them and fails with "unable to open database file". Then nothing is mid-write, so the
-    file can safely be read as immutable."""
-    uri = f"file:{quote(path)}"
-    try:
-        cursor_db = sqlite3.connect(f"{uri}?mode=ro", uri=True)
-        cursor_db.execute("select 1 from cursorDiskKV limit 1")
-        return cursor_db
-    except sqlite3.OperationalError:
-        return sqlite3.connect(f"{uri}?immutable=1", uri=True)
+    return open_readonly(path, "select 1 from cursorDiskKV limit 1")
 
 
 def parse_composer(cursor_db, composer: dict, composer_id: str, db_path: str) -> Session:
