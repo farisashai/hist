@@ -35,6 +35,7 @@ def iso(ts) -> str | None:
     s = str(ts)
     if s.isdigit():
         return iso(int(s))
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)  # nanoseconds (Devin): fromisoformat takes at most microseconds
     try:
         d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
