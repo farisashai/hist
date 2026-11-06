@@ -7,23 +7,10 @@ narrow as you type, read the transcript, and press enter to jump back into it in
 - **Fully local.** hist reads the transcript files the clients already wrote to your disk and keeps its own SQLite
   index in `~/.cache/agent-history/index.db`. It has no server, account or telemetry, and it makes no network
   requests, so none of your conversations leave your machine. (The one opt-in exception is `hist summarize`, below.)
-- **Agent friendly.** Every command takes `--json` (JSON on stdout, progress on stderr, stable exit codes), and
-  `hist help` documents each flag with examples. An agent can search your past sessions and read the relevant
-  messages the same way you do in the TUI. See [For agents](#for-agents).
+- **Agent friendly.** The commands that return data take `--json` (JSON on stdout, progress on stderr, stable exit
+  codes), and `hist help` documents each flag with examples. An agent can search your past sessions and read the
+  relevant messages the same way you do in the TUI. See [For agents](#for-agents).
 - **No dependencies.** It's a Python standard-library package (`./hist`), so there's nothing to `pip install`.
-
-### What stays on your machine
-
-| | reads | writes | network |
-|---|---|---|---|
-| `hist`, `search`, `show`, `dirs`, `sources`, `index`, `annotate` | client transcripts on disk, your `config.toml` | `~/.cache/agent-history/` | none |
-| `config` | `~/.config/agent-history/config.toml` | the same file, only with `--init` | none |
-| `enter` in the TUI | – | – | none from hist; it launches the client you resume, which talks to its own service as usual |
-| `hist summarize` (opt-in, only when you run it) | the selected transcripts | titles/summaries into the index | **sends condensed transcripts to `claude -p`** (or `summarize.command` in your config, or `$HIST_SUMMARIZER`); point it at a local model to stay offline |
-| `ready`, `install-hooks`, hooks | your git repo, client configs | hook entries in client configs, `~/.cache/agent-history/` | none from hist; if you've installed [`cm`](#companion-tools-not-reimplemented-here), the hooks call it, and it follows its own settings |
-
-hist never modifies the clients' conversation data. `install-hooks` is the only command that edits their
-configuration files, and it backs them up first.
 
 ## Install and run
 
@@ -54,9 +41,23 @@ hist -d . --since 7d        # open pre-filtered to this directory and the last w
 hist help                   # every command, for scripting and agents
 ```
 
-To update, `git pull` in the checkout. To uninstall, remove the symlink and the index
-(`rm ~/.local/bin/hist && rm -r ~/.cache/agent-history ~/.config/agent-history`), plus `hist install-hooks --uninstall` if you installed
-the hooks. Searching only reads the clients' data; it never modifies it.
+To update, `git pull` in the checkout. To uninstall, remove the symlink, the index and your settings
+(`rm ~/.local/bin/hist && rm -r ~/.cache/agent-history ~/.config/agent-history`), plus
+`hist install-hooks --uninstall` if you installed the hooks. Searching only reads the clients' data; it never
+modifies it.
+
+## What stays on your machine
+
+| | reads | writes | network |
+|---|---|---|---|
+| `hist`, `search`, `show`, `dirs`, `sources`, `index`, `annotate` | client transcripts on disk, your `config.toml` | `~/.cache/agent-history/` | none |
+| `config` | `~/.config/agent-history/config.toml` | the same file, only with `--init` | none |
+| `enter` in the TUI | – | – | none from hist; it launches the client you resume, which talks to its own service as usual |
+| `hist summarize` (opt-in, only when you run it) | the first 4 and last 6 user/assistant messages of each selected session (default: the past week's unsummarized ones) | titles/summaries into the index | **sends those messages to `claude -p --model haiku`** (or `summarize.command` in your config, or `$HIST_SUMMARIZER`); point it at a local model to stay offline |
+| `ready`, `install-hooks`, hooks | your git repo, client configs | hook entries in client configs, `~/.cache/agent-history/` | none from hist; if you've installed [`cm`](#companion-tools-not-reimplemented-here), the hooks call it, and it follows its own settings |
+
+hist never modifies the clients' conversation data. `install-hooks` is the only command that edits their
+configuration files, and it backs them up first.
 
 ## Settings
 
@@ -125,7 +126,8 @@ hist is meant to be run by agents as well as people. It's a local CLI, so an age
 MCP server, API key or network access. Tell your agent something like *"use `hist` to find how we fixed this
 before"* and it can discover the commands with `hist help`. The output is designed for that use:
 
-- `--json` on every command: JSONL results on stdout; progress and notes go only to stderr.
+- `--json` on every command that returns data (`search`, `show`, `dirs`, `sources`, `summarize`, `config`, `ready`):
+  JSONL results on stdout; progress and notes go only to stderr.
 - Small, targeted reads: search returns matching snippets (`hits_preview`), and `show` can read just
   `--grep` matches, a `--range` of messages, or the `--tail`, with `--max-chars` capping each message.
 - Ids resolve by unique prefix, and errors come back as JSON with a hint, such as the candidates for an
@@ -184,7 +186,7 @@ goes through. Turns that changed nothing (questions, reviews) are never interrup
 hist ready                       # the same scan, by hand, on the current branch
 hist ready --request "fix the radius in web/src/chart.tsx" --json
 hist install-hooks --dry-run     # show the config diff for Claude Code, Codex and Cursor
-hist install-hooks               # install (backs up ~/.claude/settings.json); --uninstall removes only these hooks
+hist install-hooks               # install (backs up each config it edits); --uninstall removes only these hooks
 ```
 
 The prompt hook snapshots the working tree (so the stop hook knows what *this turn* changed) and adds up to three
@@ -223,6 +225,8 @@ Codex asks you to approve new hooks once; Cursor reads `~/.cursor/hooks.json` af
 - Devin cloud sessions you've never opened in the Devin desktop app (e.g. ones only seen in Slack or the web app)
   aren't cached locally. Devin's thoughts aren't indexed (like other clients' reasoning), nor is streamed terminal
   output, which the cache keeps only as a compressed blob; each command's final output is.
+- The Devin CLI's own session store (`~/.local/share/devin/cli/sessions.db`) isn't read; Devin CLI sessions are
+  indexed when they run inside the Devin desktop app.
 - Cursor background-agent details cached as protobuf (`bcCachedDetails`) aren't decoded; their conversations show
   up through the regular composer records when synced.
 
@@ -234,7 +238,7 @@ Python 3.9+ standard library only. `./hist` is a small launcher (safe to symlink
 |---|---|
 | `cli.py` | argument parsing, the subcommands, error reporting / exit codes |
 | `tui.py` | curses UI: filter bar, live search box (`LineEditor`), result list, `TranscriptView` |
-| `query.py` | `Query` (validated filters → SQL), `search`, directory and source listings |
+| `query.py` | `Query` (validated filters → SQL, word matching, exact-match grouping), `search`, directory and source listings |
 | `store.py` | SQLite schema, `Session` record, writing/reading sessions, annotations |
 | `sources/` | one parser per client (`claude.py`, `codex.py`, `cursor.py`, `devin.py`) plus the incremental indexing driver |
 | `summarize.py` | on-demand LLM titles/summaries |
