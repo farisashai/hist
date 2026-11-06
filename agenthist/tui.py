@@ -187,7 +187,7 @@ class TUI:
                 continue
 
             if key in ("\n", curses.KEY_ENTER):
-                open_after = live and bool(editor.text)
+                open_after = live  # the search box opens the selection, typed into or not; other filters just apply
                 break
             if key == "\t":
                 open_after = False
