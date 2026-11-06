@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from . import markdown, store
 from .query import Query, dir_warning, resume_argv, search
-from .sources import index_all
+from .sources import SOURCES, index_all
 from .util import local, short_path
 
 
@@ -38,7 +38,7 @@ FILTERS = [
 FILTER_BY_HOTKEY = {f.hotkey: f for f in FILTERS}
 LIVE_FILTERS = ("query", "regex")  # filters that search on every keystroke
 
-SOURCE_BADGES = {"claude": "CC", "claude-desktop": "CD", "codex": "CX", "cursor": "CU", "devin": "DV"}
+SOURCE_WIDTH = max(len(name) for name in SOURCES)
 RESULT_LIMIT = 300
 DEBOUNCE_MS = 90
 
@@ -267,10 +267,9 @@ class TUI:
 
         for row, session in enumerate(self.results[self.scroll:self.scroll + height]):
             index = self.scroll + row
-            badge = SOURCE_BADGES.get(session["source"], "??")
             hits = f"{session['hits']:>4}" if session["hits"] else "    "
             title = (session["title"] or "(untitled)")[:60]
-            line = f"{local(session['last_hit'])} {badge} {hits} {title:<60} {short_path(session['cwd'])}"
+            line = f"{local(session['last_hit'])} {session['source']:<{SOURCE_WIDTH}} {hits} {title:<60} {short_path(session['cwd'])}"
             self.put(top + row, 0, line.ljust(width), curses.A_REVERSE if index == self.selected else 0)
 
     def draw_preview(self, top: int, bottom: int, width: int) -> None:
