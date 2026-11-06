@@ -135,7 +135,8 @@ hist search -e 'Shadow (AI|skills)' --until 2026-09-15 -s codex,cursor --json
 hist show <id-or-prefix> --no-tools --json                     # full transcript (+ --range 40:80, --tail N, --max-chars N)
 hist show <id> --grep 'migration'                              # only matching messages
 hist annotate <id> --title "..." --summary "..." --tags a,b --by my-agent   # persists across re-index
-hist summarize -d ~/src/app --since 30d -n 20                  # LLM-fill missing summaries (claude -p, on demand)
+hist summarize                                                 # LLM-fill missing summaries from the past week (on demand)
+hist summarize --since 30d -n 20                               # …or a longer window (--since all), capped at 20
 hist dirs --json                                               # discover roots for -d
 hist sources --json
 hist help | hist <command> --help                              # every command documents flags, examples, JSON fields

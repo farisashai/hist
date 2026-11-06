@@ -129,9 +129,13 @@ def cmd_summarize(db, args: dict) -> None:
         targets = [store.get_session(db, store.resolve_session(db, args["session"]))]
     else:
         args["missing_summary"] = not args["force"]
+        if args["since"] == "all":
+            args["since"] = None
+        args["limit"] = args["limit"] or SUMMARIZE_ALL
         targets = search(db, Query.from_args(args))
     if not targets:
-        note("nothing to summarize (all matching sessions already have summaries; --force to redo)")
+        window = f"active since {args['since']}" if args.get("since") else "matching"
+        note(f"nothing to summarize: every session {window} has a summary (--since 30d or --since all to go further back; --force to redo)")
         return
 
     command = summarizer_command(args["cmd_line"])
@@ -229,6 +233,9 @@ def cmd_config(args: dict) -> None:
     print(f"\ntimes look like: {local(iso(now - 32 * 60))} · {local(iso(now - 3 * 86400))}")
 
 
+SUMMARIZE_ALL = 1_000_000  # summarize has no default cap: the --since window bounds it
+
+
 # Commands that never need the session index (the hooks must stay fast).
 INDEXLESS_COMMANDS = {"ready": cmd_ready, "hook": cmd_hook, "install-hooks": cmd_install_hooks, "config": cmd_config}
 
@@ -311,11 +318,13 @@ def build_parser() -> tuple[Parser, argparse._SubParsersAction]:
     annotate.add_argument("--by", default=os.environ.get("HIST_AGENT", "user"), help="author label (default $HIST_AGENT or 'user')")
     annotate.add_argument("--clear", action="store_true", help="remove the annotation")
 
-    summarize = command("summarize", "LLM-generate title+summary for sessions lacking an annotation (runs only when asked)", [
-        "hist summarize <id>", "hist summarize -d ~/src/app --since 14d -n 20",
-        'HIST_SUMMARIZER="codex exec" hist summarize -s cursor'])
-    summarize.add_argument("session", nargs="?", help="one session; otherwise the filters select up to -n sessions")
-    add_search_flags(summarize, default_limit=10)
+    summarize = command("summarize", "LLM-generate title+summary for sessions active in the past week that lack one "
+                                     "(runs only when asked; --since to change the window)", [
+        "hist summarize", "hist summarize <id>", "hist summarize --since 30d", "hist summarize --since all -n 20",
+        "hist summarize -d ~/src/app -s cursor", 'HIST_SUMMARIZER="codex exec" hist summarize'])
+    summarize.add_argument("session", nargs="?", help="one session; otherwise the filters select the sessions")
+    add_search_flags(summarize, default_limit=None)
+    summarize.set_defaults(since="7d")
     summarize.add_argument("--force", action="store_true", help="also redo sessions that already have a summary")
     summarize.add_argument("--cmd-line", help="command reading the prompt on stdin, printing JSON (default: $HIST_SUMMARIZER, "
                                               f"else summarize.command in config.toml, else {DEFAULT_COMMAND})")
@@ -354,7 +363,7 @@ def build_parser() -> tuple[Parser, argparse._SubParsersAction]:
     return parser, commands
 
 
-def add_search_flags(parser: Parser, default_limit: int = 50) -> None:
+def add_search_flags(parser: Parser, default_limit: int | None = 50) -> None:
     filters = parser.add_argument_group("filters (AND-ed; message filters must match the same message)")
     filters.add_argument("-q", "--query", metavar="TEXT", help="case-insensitive literal substring (like rg -F -i)")
     filters.add_argument("-e", "--regex", metavar="RE", help="regex, case-sensitive unless (?i) (like rg -e)")
@@ -368,7 +377,8 @@ def add_search_flags(parser: Parser, default_limit: int = 50) -> None:
     filters.add_argument("--missing-summary", action="store_true", help="only sessions without an annotation summary")
 
     output = parser.add_argument_group("output")
-    output.add_argument("-n", "--limit", type=int, default=default_limit, metavar="N", help=f"max sessions (default {default_limit})")
+    output.add_argument("-n", "--limit", type=int, default=default_limit, metavar="N",
+                        help=f"max sessions (default {default_limit or 'all'})")
     output.add_argument("--json", action="store_true", help="JSONL: one session object per line")
     output.add_argument("--no-index", action="store_true", help="skip the incremental refresh")
 
