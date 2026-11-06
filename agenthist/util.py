@@ -49,14 +49,18 @@ def _fmt(d: dt.datetime) -> str:
     return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def local(ts: str | None) -> str:
-    """UTC ISO timestamp → 'YYYY-MM-DD HH:MM' in local time, for display."""
+def local(ts: str | None, width: int = 0) -> str:
+    """UTC ISO timestamp → local time per the display settings (default 'YYYY-MM-DD HH:MM'), padded to width."""
+    from .settings import format_time  # settings imports this module
     if not ts:
-        return "?"
+        return "?".ljust(width)
     try:
-        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+        when = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
-        return ts
+        return ts.ljust(width)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return format_time(when).ljust(width)
 
 
 def short_path(p: str | None) -> str:

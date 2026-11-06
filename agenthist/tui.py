@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from . import markdown, store
 from .query import Query, dir_warning, resume_argv, search
 from .sources import SOURCES, index_all
+from .settings import time_width
 from .util import local, short_path
 
 
@@ -39,7 +40,6 @@ FILTER_BY_HOTKEY = {f.hotkey: f for f in FILTERS}
 LIVE_FILTERS = ("query", "regex")  # filters that search on every keystroke
 
 SOURCE_WIDTH = max(len(name) for name in SOURCES)
-RESULT_PREFIX_WIDTH = len("2026-11-06 01:07") + 1 + SOURCE_WIDTH + 1 + 4 + 1  # time, source, hits
 RESULT_LIMIT = 300
 DEBOUNCE_MS = 90
 
@@ -269,11 +269,12 @@ class TUI:
         visible = self.results[self.scroll:self.scroll + height]
         titles = [session["title"] or "(untitled)" for session in visible]
         paths = [short_path(session["cwd"]) for session in visible]
-        title_width, path_width = column_widths(titles, paths, width - 1 - RESULT_PREFIX_WIDTH)
+        prefix_width = time_width() + 1 + SOURCE_WIDTH + 1 + 4 + 1  # time, source, hits
+        title_width, path_width = column_widths(titles, paths, width - 1 - prefix_width)
         for row, session in enumerate(visible):
             index = self.scroll + row
             hits = f"{session['hits']:>4}" if session["hits"] else "    "
-            line = (f"{local(session['last_hit'])} {session['source']:<{SOURCE_WIDTH}} {hits} "
+            line = (f"{local(session['last_hit'], time_width())} {session['source']:<{SOURCE_WIDTH}} {hits} "
                     f"{clip(titles[row], title_width):<{title_width}}  {clip_left(paths[row], path_width)}")
             self.put(top + row, 0, line.ljust(width), curses.A_REVERSE if index == self.selected else 0)
 
@@ -301,7 +302,7 @@ class TUI:
         for hit in hits:
             if y >= bottom:
                 break
-            self.put(y, 0, f"{local(hit['ts'])} {hit['role']}", curses.color_pair(YELLOW))
+            self.put(y, 0, f"{local(hit['ts'], time_width())} {hit['role']}", curses.color_pair(YELLOW))
             for line in textwrap.wrap(hit["snippet"], width - 4)[:3]:
                 y += 1
                 self.put(y, 2, line)

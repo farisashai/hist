@@ -7,13 +7,15 @@ import os
 import re
 import shlex
 import sys
+import time
 
 from . import __doc__ as OVERVIEW
-from . import hooks, install, ready, store
+from . import hooks, install, ready, settings, store
 from .query import Query, dir_warning, list_dirs, parse_sources, parse_when, resume_command, search, source_stats
 from .sources import SOURCES, index_all
 from .summarize import DEFAULT_COMMAND, summarize_session
-from .util import HistError, cap, local, note, short_path
+from .settings import time_width
+from .util import HistError, cap, iso, local, note, short_path
 
 BOLD, DIM, CYAN, RESET = "\033[1m", "\033[2m", "\033[36m", "\033[0m"
 
@@ -35,11 +37,11 @@ def cmd_search(db, args: dict) -> None:
         note("no matches")
     for s in results:
         hits = f", {s['hits']} hits" if s["hits"] else ""
-        print(f"{BOLD}{local(s['last_hit'])}  {s['source']:<14} {s['title'] or '(untitled)'}{RESET}")
+        print(f"{BOLD}{local(s['last_hit'], time_width())}  {s['source']:<14} {s['title'] or '(untitled)'}{RESET}")
         print(f"  {short_path(s['cwd'])}   id={s['native_id']}   {s['n_msgs']} msgs{hits}")
         print(f"  {CYAN}{(s['summary'] or '')[:200]}{RESET}")
         for hit in s.get("hits_preview", []):
-            print(f"    {DIM}{local(hit['ts'])} {hit['role']:<9}{RESET} {hit['snippet'][:160]}")
+            print(f"    {DIM}{local(hit['ts'], time_width())} {hit['role']:<9}{RESET} {hit['snippet'][:160]}")
 
 
 def cmd_show(db, args: dict) -> None:
@@ -101,7 +103,7 @@ def cmd_dirs(db, args: dict) -> None:
             print(json.dumps(row))
         return
     for row in rows:
-        print(f"{local(row['last_active'])}  {row['sessions']:>4}  {short_path(row['cwd']):<70} {row['sources']}")
+        print(f"{local(row['last_active'], time_width())}  {row['sessions']:>4}  {short_path(row['cwd']):<70} {row['sources']}")
 
 
 def cmd_sources(db, args: dict) -> None:
@@ -204,8 +206,30 @@ def cmd_install_hooks(args: dict) -> None:
             note("Cursor picks up ~/.cursor/hooks.json after a restart.")
 
 
+def cmd_config(args: dict) -> None:
+    path = settings.CONFIG_PATH
+    if args["init"]:
+        if os.path.exists(path):
+            raise HistError(f"{path} already exists", "edit it, or move it aside to start over")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(settings.TEMPLATE)
+        note(f"wrote {path}")
+    values = settings.settings()
+    if args["json"]:
+        print_json({"path": path, "exists": os.path.exists(path), "settings": values})
+        return
+    print(f"{path}{'' if os.path.exists(path) else '  (not created yet: `hist config --init`)'}")
+    for table, entries in values.items():
+        print(f"\n[{table}]")
+        for key, value in entries.items():
+            print(f"{key} = {json.dumps(value)}")
+    now = time.time()
+    print(f"\ntimes look like: {local(iso(now - 32 * 60))} · {local(iso(now - 3 * 86400))}")
+
+
 # Commands that never need the session index (the hooks must stay fast).
-INDEXLESS_COMMANDS = {"ready": cmd_ready, "hook": cmd_hook, "install-hooks": cmd_install_hooks}
+INDEXLESS_COMMANDS = {"ready": cmd_ready, "hook": cmd_hook, "install-hooks": cmd_install_hooks, "config": cmd_config}
 
 COMMANDS = {
     "search": cmd_search,
@@ -320,6 +344,11 @@ def build_parser() -> tuple[Parser, argparse._SubParsersAction]:
     installer.add_argument("--dry-run", action="store_true", help="show the diff without writing")
     installer.add_argument("--uninstall", action="store_true", help="remove the hist hooks")
 
+    config = command("config", f"show your settings ({settings.CONFIG_PATH}); --init writes a commented starter file", [
+        "hist config", "hist config --init", "hist config --json"])
+    config.add_argument("--init", action="store_true", help="create the file with every setting documented")
+    config.add_argument("--json", action="store_true")
+
     command("help", "show this help", ["hist help", "hist help search"]).add_argument("topic", nargs="?")
     return parser, commands
 
@@ -377,6 +406,7 @@ def run(argv: list[str]) -> None:
     if command == "tui" and not sys.stdout.isatty():
         raise HistError("the TUI needs a terminal", "agents: use `hist search --json` / `hist show --json` (see `hist help`)")
 
+    settings.settings()  # report config problems now, not mid-output or under the TUI's screen
     db = store.connect()
     index_is_empty = not db.execute("select 1 from sessions limit 1").fetchone()
     wants_refresh = command not in ("index", "annotate") and (not args.get("no_index") or index_is_empty)

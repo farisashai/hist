@@ -16,7 +16,8 @@ narrow as you type, read the transcript, and press enter to jump back into it in
 
 | | reads | writes | network |
 |---|---|---|---|
-| `hist`, `search`, `show`, `dirs`, `sources`, `index`, `annotate` | client transcripts on disk | `~/.cache/agent-history/` | none |
+| `hist`, `search`, `show`, `dirs`, `sources`, `index`, `annotate` | client transcripts on disk, your `config.toml` | `~/.cache/agent-history/` | none |
+| `config` | `~/.config/agent-history/config.toml` | the same file, only with `--init` | none |
 | `enter` in the TUI | – | – | none from hist; it launches the client you resume, which talks to its own service as usual |
 | `hist summarize` (opt-in, only when you run it) | the selected transcripts | titles/summaries into the index | **sends condensed transcripts to `claude -p`** (or the command in `$HIST_SUMMARIZER`); point it at a local model to stay offline |
 | `ready`, `install-hooks`, hooks | your git repo, client configs | hook entries in client configs, `~/.cache/agent-history/` | none from hist; if you've installed [`cm`](#companion-tools-not-reimplemented-here), the hooks call it, and it follows its own settings |
@@ -54,8 +55,22 @@ hist help                   # every command, for scripting and agents
 ```
 
 To update, `git pull` in the checkout. To uninstall, remove the symlink and the index
-(`rm ~/.local/bin/hist && rm -r ~/.cache/agent-history`), plus `hist install-hooks --uninstall` if you installed
+(`rm ~/.local/bin/hist && rm -r ~/.cache/agent-history ~/.config/agent-history`), plus `hist install-hooks --uninstall` if you installed
 the hooks. Searching only reads the clients' data; it never modifies it.
+
+## Settings
+
+`~/.config/agent-history/config.toml` (or `$HIST_CONFIG`). `hist config` shows the values in effect and an
+example time; `hist config --init` writes the file with every setting documented.
+
+```toml
+[display]
+date_format = "%b %-d, %Y %-I:%M%p"   # Nov 4, 2026 11:23AM; strftime codes, local time zone and locale
+relative_within = "1d"               # newer times read "32 minutes ago", "5 hours ago"; "" (default) = never
+```
+
+The default is `date_format = "%Y-%m-%d %H:%M"`. Settings change what people see in the TUI and plain output;
+`--json` always carries ISO 8601 UTC timestamps. A mistyped setting is reported and its default used.
 
 ## TUI
 
@@ -213,6 +228,7 @@ Python 3.9+ standard library only. `./hist` is a small launcher (safe to symlink
 | `store.py` | SQLite schema, `Session` record, writing/reading sessions, annotations |
 | `sources/` | one parser per client (`claude.py`, `codex.py`, `cursor.py`, `devin.py`) plus the incremental indexing driver |
 | `summarize.py` | on-demand LLM titles/summaries |
+| `settings.py` | `config.toml`: reading it and formatting times per your display settings |
 | `util.py` | errors, timestamps, text cleanup, display formatting |
 
 To support another client, add `sources/<name>.py` with `index(db, paths, full) -> int` that builds `store.Session`
