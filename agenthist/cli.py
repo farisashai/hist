@@ -13,7 +13,7 @@ from . import __doc__ as OVERVIEW
 from . import hooks, install, ready, settings, store
 from .query import Query, dir_warning, list_dirs, parse_sources, parse_when, resume_command, search, source_stats
 from .sources import SOURCES, index_all
-from .summarize import DEFAULT_COMMAND, summarize_session
+from .summarize import DEFAULT_COMMAND, summarize_session, summarizer_command
 from .settings import time_width
 from .util import HistError, cap, iso, local, note, short_path
 
@@ -134,10 +134,11 @@ def cmd_summarize(db, args: dict) -> None:
         note("nothing to summarize (all matching sessions already have summaries; --force to redo)")
         return
 
-    print(f"summarizing {len(targets)} session(s) with `{args['cmd_line']}` …", file=sys.stderr)
+    command = summarizer_command(args["cmd_line"])
+    print(f"summarizing {len(targets)} session(s) with `{command}` …", file=sys.stderr)
     for session in targets:
         try:
-            labels = summarize_session(db, session["id"], args["cmd_line"])
+            labels = summarize_session(db, session["id"], command)
         except (RuntimeError, OSError, ValueError) as e:
             print(f"✗ {session['native_id']}: {e}", file=sys.stderr)
             continue
@@ -316,8 +317,8 @@ def build_parser() -> tuple[Parser, argparse._SubParsersAction]:
     summarize.add_argument("session", nargs="?", help="one session; otherwise the filters select up to -n sessions")
     add_search_flags(summarize, default_limit=10)
     summarize.add_argument("--force", action="store_true", help="also redo sessions that already have a summary")
-    summarize.add_argument("--cmd-line", default=os.environ.get("HIST_SUMMARIZER", DEFAULT_COMMAND),
-                           help=f"command reading the prompt on stdin, printing JSON (default: $HIST_SUMMARIZER or {DEFAULT_COMMAND})")
+    summarize.add_argument("--cmd-line", help="command reading the prompt on stdin, printing JSON (default: $HIST_SUMMARIZER, "
+                                              f"else summarize.command in config.toml, else {DEFAULT_COMMAND})")
 
     index = command("index", "refresh the index (incremental; --full re-parses everything)", ["hist index", "hist index --full"])
     index.add_argument("--full", action="store_true")

@@ -4,6 +4,9 @@
     date_format = "%b %-d, %Y %-I:%M%p"   # strftime, in your local time zone and locale
     relative_within = "1d"               # newer times read "32 minutes ago"; "" = always date_format
 
+    [summarize]
+    command = "claude -p --model sonnet"  # what `hist summarize` runs; "" = the default (haiku)
+
 Python 3.11+ reads the file with tomllib; older versions use a small reader for the subset hist needs
 (tables, and string/number/boolean values). A bad file never stops hist: it warns and uses the defaults.
 """
@@ -24,6 +27,9 @@ DEFAULTS = {
         "date_format": "%Y-%m-%d %H:%M",
         "relative_within": "",
     },
+    "summarize": {
+        "command": "",
+    },
 }
 
 TEMPLATE = """\
@@ -37,6 +43,12 @@ date_format = "%Y-%m-%d %H:%M"
 
 # Show times newer than this as "32 minutes ago", "5 hours ago": 90m, 12h, 1d, 2w; "" = never.
 relative_within = ""
+
+[summarize]
+# The command `hist summarize` runs: it reads the prompt on stdin and prints JSON. "" = claude -p --model haiku.
+# $HIST_SUMMARIZER and --cmd-line override it. Examples: "claude -p --model sonnet", "codex exec",
+# or a local model such as "ollama run llama3.2" to keep transcripts offline.
+command = ""
 """
 
 DURATION = re.compile(r"^\s*(\d+)\s*([mhdw])\s*$")

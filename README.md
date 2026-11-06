@@ -19,7 +19,7 @@ narrow as you type, read the transcript, and press enter to jump back into it in
 | `hist`, `search`, `show`, `dirs`, `sources`, `index`, `annotate` | client transcripts on disk, your `config.toml` | `~/.cache/agent-history/` | none |
 | `config` | `~/.config/agent-history/config.toml` | the same file, only with `--init` | none |
 | `enter` in the TUI | – | – | none from hist; it launches the client you resume, which talks to its own service as usual |
-| `hist summarize` (opt-in, only when you run it) | the selected transcripts | titles/summaries into the index | **sends condensed transcripts to `claude -p`** (or the command in `$HIST_SUMMARIZER`); point it at a local model to stay offline |
+| `hist summarize` (opt-in, only when you run it) | the selected transcripts | titles/summaries into the index | **sends condensed transcripts to `claude -p`** (or `summarize.command` in your config, or `$HIST_SUMMARIZER`); point it at a local model to stay offline |
 | `ready`, `install-hooks`, hooks | your git repo, client configs | hook entries in client configs, `~/.cache/agent-history/` | none from hist; if you've installed [`cm`](#companion-tools-not-reimplemented-here), the hooks call it, and it follows its own settings |
 
 hist never modifies the clients' conversation data. `install-hooks` is the only command that edits their
@@ -67,7 +67,12 @@ example time; `hist config --init` writes the file with every setting documented
 [display]
 date_format = "%b %-d, %Y %-I:%M%p"   # Nov 4, 2026 11:23AM; strftime codes, local time zone and locale
 relative_within = "1d"               # newer times read "32 minutes ago", "5 hours ago"; "" (default) = never
+
+[summarize]
+command = "claude -p --model sonnet"  # what `hist summarize` runs (stdin prompt → JSON); "" = claude -p --model haiku
 ```
+
+For `hist summarize`, `--cmd-line` beats `$HIST_SUMMARIZER`, which beats `summarize.command`.
 
 The default is `date_format = "%Y-%m-%d %H:%M"`. Settings change what people see in the TUI and plain output;
 `--json` always carries ISO 8601 UTC timestamps. A mistyped setting is reported and its default used.

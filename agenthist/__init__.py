@@ -23,5 +23,5 @@ Typical agent flow:
 
 Exit codes: 0 ok (an empty result is still 0)  2 invalid arguments  3 session not found/ambiguous  1 internal error
 Errors with --json: {"error": "...", "hint": "...", "code": N} on stdout.
-Env: HIST_DB (index path, default ~/.cache/agent-history/index.db), HIST_AGENT (default --by), HIST_SUMMARIZER.
+Env: HIST_DB (index path, default ~/.cache/agent-history/index.db), HIST_AGENT (default --by), HIST_SUMMARIZER, HIST_CONFIG (settings file).
 """

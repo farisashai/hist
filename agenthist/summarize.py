@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import sqlite3
@@ -16,6 +17,12 @@ PROMPT = SUMMARIZER_MARKER + """ so it can be found later.
 Return ONLY a JSON object: {"title": "<=8 word specific title", "summary": "2-3 sentences: the goal, what was done/decided, outcome or open state. Name concrete files, systems, PRs, errors."}
 Transcript (user/assistant text only, truncated):
 """
+
+
+def summarizer_command(flag: str | None = None) -> str:
+    """--cmd-line, else $HIST_SUMMARIZER, else summarize.command in config.toml, else the default."""
+    from .settings import settings
+    return flag or os.environ.get("HIST_SUMMARIZER") or settings()["summarize"]["command"] or DEFAULT_COMMAND
 
 
 def summarize_session(db: sqlite3.Connection, session_id: str, command: str = DEFAULT_COMMAND) -> dict:
