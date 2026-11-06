@@ -39,6 +39,7 @@ FILTER_BY_HOTKEY = {f.hotkey: f for f in FILTERS}
 LIVE_FILTERS = ("query", "regex")  # filters that search on every keystroke
 
 SOURCE_WIDTH = max(len(name) for name in SOURCES)
+RESULT_PREFIX_WIDTH = len("2026-11-06 01:07") + 1 + SOURCE_WIDTH + 1 + 4 + 1  # time, source, hits
 RESULT_LIMIT = 300
 DEBOUNCE_MS = 90
 
@@ -265,11 +266,15 @@ class TUI:
         if self.selected >= self.scroll + height:
             self.scroll = self.selected - height + 1
 
-        for row, session in enumerate(self.results[self.scroll:self.scroll + height]):
+        visible = self.results[self.scroll:self.scroll + height]
+        titles = [session["title"] or "(untitled)" for session in visible]
+        paths = [short_path(session["cwd"]) for session in visible]
+        title_width, path_width = column_widths(titles, paths, width - 1 - RESULT_PREFIX_WIDTH)
+        for row, session in enumerate(visible):
             index = self.scroll + row
             hits = f"{session['hits']:>4}" if session["hits"] else "    "
-            title = (session["title"] or "(untitled)")[:60]
-            line = f"{local(session['last_hit'])} {session['source']:<{SOURCE_WIDTH}} {hits} {title:<60} {short_path(session['cwd'])}"
+            line = (f"{local(session['last_hit'])} {session['source']:<{SOURCE_WIDTH}} {hits} "
+                    f"{clip(titles[row], title_width):<{title_width}}  {clip_left(paths[row], path_width)}")
             self.put(top + row, 0, line.ljust(width), curses.A_REVERSE if index == self.selected else 0)
 
     def draw_preview(self, top: int, bottom: int, width: int) -> None:
@@ -476,6 +481,25 @@ def style_attr(styles: frozenset) -> int:
     if "dim" in styles:
         attr |= curses.A_DIM
     return attr
+
+
+def column_widths(titles: list[str], paths: list[str], available: int) -> tuple[int, int]:
+    """Split a result row's free space between the title and directory columns. Each gets what its longest
+    visible entry needs when both fit; otherwise the directory keeps up to 40% and the title takes the rest."""
+    available = max(0, available - 2)  # the gap between the columns
+    title_need, path_need = max(map(len, titles), default=0), max(map(len, paths), default=0)
+    path_width = min(path_need, max(available * 2 // 5, available - title_need))
+    return min(title_need, available - path_width), path_width
+
+
+def clip(text: str, width: int) -> str:
+    """Cut text to width, marking the cut with an ellipsis."""
+    return text if len(text) <= width else text[:max(0, width - 1)] + "…"[:width]
+
+
+def clip_left(text: str, width: int) -> str:
+    """Cut text to width from the left, keeping its end (a path's most specific part)."""
+    return text if len(text) <= width else "…"[:width] + text[len(text) - max(0, width - 1):]
 
 
 def is_partial_time(value: str) -> bool:
