@@ -9,14 +9,21 @@ import sqlite3
 import subprocess
 
 from .store import SUMMARIZER_MARKER, annotate, get_messages
+from .util import cap, human_text
 
 DEFAULT_COMMAND = "claude -p --model haiku"
 WHITESPACE = re.compile(r"\s+")
 
 PROMPT = SUMMARIZER_MARKER + """ so it can be found later.
-Return ONLY a JSON object: {"title": "<=8 word specific title", "summary": "2-3 sentences: the goal, what was done/decided, outcome or open state. Name concrete files, systems, PRs, errors."}
-Transcript (user/assistant text only, truncated):
+You get the opening messages (the goal) and the latest messages (where it ended up). Describe the latest state:
+what exists or was decided by the end, and what is still open. Name concrete files, systems, PRs and errors.
+Return ONLY a JSON object: {"title": "<=8 word specific title", "summary": "2-3 sentences, latest state first"}
+Transcript (user/assistant text only, tool calls omitted):
 """
+
+# What the model reads: the opening exchange and the end of the conversation, nothing in between.
+HEAD_MESSAGES, TAIL_MESSAGES = 4, 6
+USER_CHARS, ASSISTANT_CHARS = 800, 500
 
 
 def summarizer_command(flag: str | None = None) -> str:
@@ -41,31 +48,16 @@ def summarize_session(db: sqlite3.Connection, session_id: str, command: str = DE
     return labels
 
 
-def condensed_transcript(db: sqlite3.Connection, session_id: str, budget: int = 14_000) -> str:
-    """User and assistant text, one line per message. Long sessions keep their beginning and end,
-    which carry the goal and the outcome, and drop the middle."""
+def condensed_transcript(db: sqlite3.Connection, session_id: str) -> str:
+    """The first few and last few user/assistant messages, one capped line each; tool calls and injected
+    preambles are left out, so the prompt stays small whatever the session's length."""
     lines = []
     for _, _, role, text in get_messages(db, session_id, include_tools=False):
-        limit = 1500 if role == "user" else 600
-        lines.append(role.upper() + ": " + WHITESPACE.sub(" ", text)[:limit])
-
-    if sum(len(line) for line in lines) <= budget:
+        text = human_text(text) if role == "user" else text
+        if text.strip():
+            limit = USER_CHARS if role == "user" else ASSISTANT_CHARS
+            lines.append(role.upper() + ": " + cap(WHITESPACE.sub(" ", text).strip(), limit))
+    if len(lines) <= HEAD_MESSAGES + TAIL_MESSAGES:
         return "\n".join(lines)
-
-    # Alternate taking lines from the front and the back until the budget runs out.
-    head, tail, used = [], [], 0
-    front, back = 0, len(lines) - 1
-    take_front = True
-    while front <= back:
-        line = lines[front] if take_front else lines[back]
-        if used + len(line) > budget:
-            break
-        used += len(line)
-        if take_front:
-            head.append(line)
-            front += 1
-        else:
-            tail.append(line)
-            back -= 1
-        take_front = not take_front
-    return "\n".join(head + ["…"] + tail[::-1])
+    omitted = len(lines) - HEAD_MESSAGES - TAIL_MESSAGES
+    return "\n".join(lines[:HEAD_MESSAGES] + [f"… ({omitted} messages omitted) …"] + lines[-TAIL_MESSAGES:])
