@@ -79,9 +79,11 @@ The default is `date_format = "%Y-%m-%d %H:%M"`. Settings change what people see
 
 ## TUI
 
-Opens fzf-style in the search box: results and the preview pane update as you type. Matching is
-case-insensitive substring search over message text, so a word or two from the conversation is usually enough;
-press `r` for a regex instead.
+Opens fzf-style in the search box: results and the preview pane update as you type. Type a few words: a session
+matches when one message contains all of them, in any order, case-insensitively (parts of words count, so `migrat`
+finds "migration"). There is no special syntax: quotes and other punctuation are searched for like any other
+character. With several words the list is grouped: **exact matches** first, where a message has the words next to
+each other as typed, then **all words, any order**; each group newest first. Press `r` for a regex instead.
 
 - **While typing**: `↑↓` select, `enter` opens the transcript at the first match, `tab` drops to the list,
   `esc` clears the search.
@@ -145,6 +147,8 @@ hist help | hist <command> --help                              # every command d
 Errors: exit 2 = bad arguments, 3 = session not found/ambiguous (the hint lists candidates). With `--json`,
 errors are `{"error", "hint", "code"}` on stdout; progress and notes always go to stderr.
 
+- `-q` words must all be in one message, in any order; results with the words adjacent as typed come first
+  (`exact: true`).
 - Message-level filters (`-q`, `-e`, `--since`, `--until`, `--role`) must hold on the **same message**, so `--since 2d -q foo`
   finds old conversations where *foo* was said in the last two days.
 - `-d` matches the session's working directory or anything beneath it.

@@ -35,7 +35,11 @@ def cmd_search(db, args: dict) -> None:
         return
     if not results:
         note("no matches")
-    for s in results:
+    exact = sum(1 for s in results if s["exact"])
+    for index, s in enumerate(results):
+        if q.phrase and exact and index in (0, exact):
+            heading = f"exact matches · “{q.phrase}” · {exact}" if index == 0 else f"all words, any order · {len(results) - exact}"
+            print(f"{CYAN}── {heading}{RESET}")
         hits = f", {s['hits']} hits" if s["hits"] else ""
         print(f"{BOLD}{local(s['last_hit'], time_width())}  {s['source']:<14} {s['title'] or '(untitled)'}{RESET}")
         print(f"  {short_path(s['cwd'])}   id={s['native_id']}   {s['n_msgs']} msgs{hits}")
@@ -279,7 +283,7 @@ def build_parser() -> tuple[Parser, argparse._SubParsersAction]:
         'hist search -e "TODO\\(\\w+\\)" -s claude,codex --role user --json',
         'hist search --since 4h --json   # sessions with any message in the last 4 hours',
         "JSON fields: id native_id source title summary summary_source first_prompt last_prompt tags cwd branch",
-        "             started updated n_msgs hits last_hit resume path hits_preview[{seq ts role snippet}]",
+        "             started updated n_msgs hits last_hit exact resume path hits_preview[{seq ts role snippet}]",
     ]))
     add_search_flags(command("tui", "interactive search (the default when run with no command)",
                              ["hist", "hist -d . --since 7d"]))
@@ -365,7 +369,8 @@ def build_parser() -> tuple[Parser, argparse._SubParsersAction]:
 
 def add_search_flags(parser: Parser, default_limit: int | None = 50) -> None:
     filters = parser.add_argument_group("filters (AND-ed; message filters must match the same message)")
-    filters.add_argument("-q", "--query", metavar="TEXT", help="case-insensitive literal substring (like rg -F -i)")
+    filters.add_argument("-q", "--query", metavar="TEXT", help="words, all in one message, any order, case-insensitive; sessions "
+                         "with the words next to each other as typed (exact matches) are listed first")
     filters.add_argument("-e", "--regex", metavar="RE", help="regex, case-sensitive unless (?i) (like rg -e)")
     filters.add_argument("-d", "--dir", metavar="PATH", help="session cwd is PATH or below it; '.' = current dir")
     filters.add_argument("--since", metavar="WHEN", help="message sent at/after WHEN: 2026-10-01, 2026-10-01T14:00, 3d, 12h, today")

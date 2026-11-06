@@ -26,7 +26,7 @@ WHEN_HINT = ("use an ISO date/time (2026-10-01, 2026-10-01T14:00, 2026-10-01T14:
 
 @dataclass
 class Query:
-    text: str | None = None        # case-insensitive substring
+    text: str | None = None        # words, all in one message, any order, case-insensitive
     regex: str | None = None       # Python regex (rg-compatible for common patterns)
     dir: str | None = None         # absolute path; matches that directory and everything below it
     since: str | None = None       # UTC ISO, inclusive
@@ -59,13 +59,31 @@ class Query:
                 re.compile(q.regex)
             except re.error as e:
                 raise HistError(f"invalid --regex {q.regex!r}: {e}",
-                                "Python re syntax (rg-compatible for common patterns); use -q for a literal substring")
+                                "Python re syntax (rg-compatible for common patterns); use -q to search for words")
         if q.limit < 1:
             raise HistError("--limit must be >= 1")
         if q.since and q.until and q.since >= q.until:
             raise HistError(f"--since ({args['since']}) is not before --until ({args['until']})",
                             "the window is [since, until)")
         return q
+
+    @property
+    def terms(self) -> list[str]:
+        """The text's words, lowercased. There is no special syntax: quotes and other punctuation are searched for
+        like any other character, and the exact phrase is found by the grouping (see `phrase`)."""
+        return (self.text or "").lower().split()
+
+    @property
+    def phrase(self) -> str | None:
+        """The words as typed, next to each other: sessions containing it are the exact matches."""
+        return " ".join(self.terms) if len(self.terms) > 1 else None
+
+    def matches(self, text: str) -> bool:
+        """Whether one message matches the text and regex filters (what the transcript view jumps between)."""
+        lowered = text.lower()
+        if any(term not in lowered for term in self.terms):
+            return False
+        return not self.regex or bool(re.search(self.regex, text))
 
     @property
     def filters_messages(self) -> bool:
@@ -79,9 +97,9 @@ class Query:
             params += self.roles
         elif not self.include_tools:
             conditions.append("m.role in ('user', 'assistant')")
-        if self.text:
+        for term in self.terms:
             conditions.append("m.text like ? escape '\\'")
-            params.append(f"%{like_escape(self.text)}%")
+            params.append(f"%{like_escape(term)}%")
         if self.regex:
             conditions.append("m.text regexp ?")
             params.append(self.regex)
@@ -112,9 +130,16 @@ class Query:
         """What to highlight in matching messages."""
         if self.regex:
             return re.compile(self.regex)
-        if self.text:
-            return re.compile(re.escape(self.text), re.I)
+        if self.terms:  # the exact phrase first, so it is highlighted as one run where the words are adjacent
+            alternatives = ([self.phrase] if self.phrase else []) + sorted(set(self.terms), key=len, reverse=True)
+            return re.compile("|".join(re.escape(a).replace(r"\ ", r"\s+") for a in alternatives), re.I)
         return None
+
+    def exact_sql(self) -> tuple[str, list]:
+        """1 for a message containing the exact phrase, else 0 (always 0 for a single word)."""
+        if not self.phrase:
+            return "0", []
+        return "(m.text like ? escape '\\')", [f"%{like_escape(self.phrase)}%"]
 
 
 # ---------------------------------------------------------------- argument parsing
@@ -172,22 +197,25 @@ def placeholders(values: list) -> str:
 # ---------------------------------------------------------------- queries
 
 def search(db: sqlite3.Connection, q: Query) -> list[dict]:
-    """Matching sessions, most recent matching activity first. Each has a few matching snippets in hits_preview."""
+    """Matching sessions, most recent matching activity first. For several words, the exact matches (a message
+    has the words next to each other, as typed) come first, then sessions with the words anywhere in a message;
+    `exact` says which. Each has a few matching snippets, exact ones first, in hits_preview."""
     session_where, session_params = q.session_conditions()
     message_where, message_params = q.message_conditions()
+    exact, exact_params = q.exact_sql()
 
     if q.filters_messages:
         rows = db.execute(f"""
-            select {SESSION_SELECT}, count(*) as hits, max(m.ts) as last_hit
+            select {SESSION_SELECT}, count(*) as hits, max(m.ts) as last_hit, max({exact}) as exact
             from messages m
             join sessions s on s.id = m.session
             left join annotations a on a.id = s.id
             where {and_all(session_where + message_where)}
-            group by s.id order by last_hit desc limit ?""",
-            session_params + message_params + [q.limit]).fetchall()
+            group by s.id order by exact desc, last_hit desc limit ?""",
+            exact_params + session_params + message_params + [q.limit]).fetchall()
     else:
         rows = db.execute(f"""
-            select {SESSION_SELECT}, 0 as hits, s.updated as last_hit
+            select {SESSION_SELECT}, 0 as hits, s.updated as last_hit, 0 as exact
             from {SESSION_FROM}
             where {and_all(session_where)}
             order by s.updated desc limit ?""",
@@ -195,7 +223,8 @@ def search(db: sqlite3.Connection, q: Query) -> list[dict]:
 
     results = []
     for row in rows:
-        session = dict(zip(SESSION_KEYS + ["hits", "last_hit"], row))
+        session = dict(zip(SESSION_KEYS + ["hits", "last_hit", "exact"], row))
+        session["exact"] = bool(session["exact"])
         session["resume"] = resume_command(session)
         if q.filters_messages:
             session["hits_preview"] = matching_snippets(db, session["id"], q, message_where, message_params)
@@ -204,10 +233,12 @@ def search(db: sqlite3.Connection, q: Query) -> list[dict]:
 
 
 def matching_snippets(db, session_id: str, q: Query, conditions: list[str], params: list, limit: int = 5) -> list[dict]:
+    exact, exact_params = q.exact_sql()
+    order = f"{exact} desc, m.seq" if exact_params else "m.seq"  # a bare 0 would mean "column 0" here
     rows = db.execute(f"""
         select m.seq, m.ts, m.role, m.text from messages m
         where m.session = ? and {and_all(conditions)}
-        order by m.seq limit ?""", [session_id] + params + [limit])
+        order by {order} limit ?""", [session_id] + params + exact_params + [limit])
     return [{"seq": seq, "ts": ts, "role": role, "snippet": snippet(text, q)} for seq, ts, role, text in rows]
 
 

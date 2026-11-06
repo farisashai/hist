@@ -157,7 +157,7 @@ class TUI:
 
     def open(self, session: dict) -> None:
         query = self.current_query()
-        TranscriptView(self, session, query.hit_pattern()).run()
+        TranscriptView(self, session, query).run()
 
     def copy(self, text: str) -> None:
         try:
@@ -259,24 +259,46 @@ class TUI:
         message = self.error or self.status
         self.put(1, max(0, width - len(message) - 2), message, curses.color_pair(RED) if self.error else curses.A_DIM)
 
-    def draw_results(self, top: int, height: int, width: int) -> None:
-        # keep the selection in view
-        if self.selected < self.scroll:
-            self.scroll = self.selected
-        if self.selected >= self.scroll + height:
-            self.scroll = self.selected - height + 1
+    def display_rows(self) -> list[tuple[str, int | str]]:
+        """The result list as drawn: ("session", index into results), with ("header", text) rows above the exact
+        matches and the other matches when a several-word search has both kinds."""
+        rows = [("session", index) for index in range(len(self.results))]
+        exact = sum(1 for session in self.results if session.get("exact"))
+        phrase = Query(text=self.values["query"]).phrase
+        if not phrase or not exact:
+            return rows
+        partial = len(self.results) - exact
+        rows.insert(0, ("header", f"exact matches · “{phrase}” · {exact}"))
+        if partial:
+            rows.insert(exact + 1, ("header", f"all words, any order · {partial}"))
+        return rows
 
-        visible = self.results[self.scroll:self.scroll + height]
-        titles = [session["title"] or "(untitled)" for session in visible]
-        paths = [short_path(session["cwd"]) for session in visible]
+    def draw_results(self, top: int, height: int, width: int) -> None:
+        rows = self.display_rows()
+        selected_row = next((i for i, (kind, value) in enumerate(rows) if kind == "session" and value == self.selected), 0)
+        # keep the selection in view, with its group's header when that is the row just above
+        first_needed = selected_row - 1 if selected_row and rows[selected_row - 1][0] == "header" else selected_row
+        if first_needed < self.scroll:
+            self.scroll = first_needed
+        if selected_row >= self.scroll + height:
+            self.scroll = selected_row - height + 1
+
+        visible = rows[self.scroll:self.scroll + height]
+        sessions = [self.results[value] for kind, value in visible if kind == "session"]
+        titles = [session["title"] or "(untitled)" for session in sessions]
+        paths = [short_path(session["cwd"]) for session in sessions]
         prefix_width = time_width() + 1 + SOURCE_WIDTH + 1 + 4 + 1  # time, source, hits
         title_width, path_width = column_widths(titles, paths, width - 1 - prefix_width)
-        for row, session in enumerate(visible):
-            index = self.scroll + row
+        for row, (kind, value) in enumerate(visible):
+            if kind == "header":
+                self.put(top + row, 0, f"── {value} ".ljust(width - 1, "─"), curses.color_pair(CYAN) | curses.A_DIM)
+                continue
+            session = self.results[value]
+            title, path = session["title"] or "(untitled)", short_path(session["cwd"])
             hits = f"{session['hits']:>4}" if session["hits"] else "    "
             line = (f"{local(session['last_hit'], time_width())} {session['source']:<{SOURCE_WIDTH}} {hits} "
-                    f"{clip(titles[row], title_width):<{title_width}}  {clip_left(paths[row], path_width)}")
-            self.put(top + row, 0, line.ljust(width), curses.A_REVERSE if index == self.selected else 0)
+                    f"{clip(title, title_width):<{title_width}}  {clip_left(path, path_width)}")
+            self.put(top + row, 0, line.ljust(width), curses.A_REVERSE if value == self.selected else 0)
 
     def draw_preview(self, top: int, bottom: int, width: int) -> None:
         session = self.selected_session()
@@ -353,8 +375,9 @@ class LineEditor:
 class TranscriptView:
     """Scrollable transcript of one session, opened at the first match with matches highlighted."""
 
-    def __init__(self, tui: TUI, session: dict, hit_pattern: re.Pattern | None):
-        self.tui, self.session, self.hit_pattern = tui, session, hit_pattern
+    def __init__(self, tui: TUI, session: dict, query: Query):
+        self.tui, self.session, self.query = tui, session, query
+        self.hit_pattern = query.hit_pattern()  # every term is highlighted; a match needs all of them
         messages = store.get_messages(tui.db, session["id"], include_tools=tui.include_tools)
         _, width = tui.screen.getmaxyx()
         self.lines, self.match_lines = self.layout(messages, width)
@@ -368,7 +391,7 @@ class TranscriptView:
         role_colors = {"user": GREEN, "assistant": CYAN, "tool": MAGENTA}
         lines, match_lines = [], []
         for _, ts, role, text in messages:
-            is_match = bool(self.hit_pattern and self.hit_pattern.search(text))
+            is_match = bool(self.hit_pattern) and self.query.matches(text)
             if is_match:
                 match_lines.append(len(lines))
             header = f"── {role} · {local(ts)}" + ("  ◀ match" if is_match else "")
