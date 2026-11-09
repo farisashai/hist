@@ -13,7 +13,9 @@ from functools import partial
 
 from ..store import Session
 from ..util import cap
-from . import TEXT_LIMIT, TOOL_LIMIT, Paths, index_files
+from . import GIT_WRITE, TEXT_LIMIT, TOOL_LIMIT, Paths, index_files
+
+WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
 
 def index(db, paths: Paths, full: bool) -> int:
@@ -73,9 +75,11 @@ def read_record(session: Session, record: dict) -> None:
         return
 
     session.cwd = session.cwd or record.get("cwd")
-    session.branch = session.branch or record.get("gitBranch")
+    session.note_start_branch(record.get("gitBranch"))
     message = record.get("message") or {}
     content = message.get("content")
+    if writes(content):  # the checkout's branch at this message is where the write landed
+        session.note_branch(record.get("gitBranch"))
 
     if record.get("isCompactSummary"):  # the summary Claude writes when it compacts a long conversation
         session.native_summary = cap(content if isinstance(content, str) else join_text(content), 1500)
@@ -86,6 +90,17 @@ def read_record(session: Session, record: dict) -> None:
     timestamp = record.get("timestamp")
     for role, text in content_parts(content, message.get("role") or kind):
         session.add(timestamp, role, text)
+
+
+def writes(content) -> bool:
+    """Whether a message's tool calls change the repo: a file edit, or a git command that records work."""
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        name, args = block.get("name"), block.get("input") or {}
+        if name in WRITE_TOOLS or (name == "Bash" and GIT_WRITE.search(str(args.get("command", "")))):
+            return True
+    return False
 
 
 def content_parts(content, role: str):

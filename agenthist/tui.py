@@ -32,6 +32,7 @@ FILTERS = [
     Filter("query", "Text", "/", "live · ↑↓ select · enter open · tab list · esc clear"),
     Filter("regex", "Regex", "r", "python/rg regex"),
     Filter("dir", "Dir", "d", "path; . = cwd"),
+    Filter("branch", "Branch", "b", "part of a branch name"),
     Filter("since", "Since", "s", "2026-10-01, 3d, 12h, today"),
     Filter("until", "Until", "u", "date or 2d"),
     Filter("source", "Source", "x", "claude,claude-desktop,codex,cursor,devin"),
@@ -43,7 +44,7 @@ SOURCE_WIDTH = max(len(name) for name in SOURCES)
 RESULT_LIMIT = 300
 DEBOUNCE_MS = 90
 
-HELP = ("/ live search · R reindex · ↑↓ move · enter open · r regex · d dir · s since · u until · x source · "
+HELP = ("/ live search · R reindex · ↑↓ move · enter open · r regex · d dir · b branch · s since · u until · x source · "
         "t tools · a subagents · c clear · y copy resume · p copy path · q quit")
 
 # color pairs

@@ -6,6 +6,7 @@ File-based clients (Claude, Codex) share `index_files`; Cursor and Devin read th
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -17,6 +18,11 @@ from .. import store
 from ..util import HOME
 
 SOURCES = ("claude", "claude-desktop", "codex", "cursor", "devin")
+
+# Git commands that record work on the current branch, and ones that move the checkout to another branch.
+GIT_WRITE = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(?:commit|push|merge|rebase|cherry-pick|am)\b"
+                       r"|\bgh\s+pr\s+create\b|\bgt\s+(?:create|submit|modify)\b")
+GIT_SWITCH = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|switch)\b|\bgh\s+pr\s+checkout\b|\bgt\s+(?:checkout|co|create)\b")
 
 # Cap on stored text, so one pasted log or tool dump can't dominate the index.
 TEXT_LIMIT = 20_000

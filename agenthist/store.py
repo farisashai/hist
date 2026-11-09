@@ -12,14 +12,14 @@ from .util import HOME, HistError, human_text, iso
 DB_PATH = os.environ.get("HIST_DB", os.path.join(HOME, ".cache", "agent-history", "index.db"))
 
 # Bump when the derived tables change shape; they are dropped and rebuilt. Annotations are never dropped.
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 SCHEMA = """
 create table if not exists files(path text primary key, mtime real, size int);
 create table if not exists sessions(
     id text primary key, source text, native_id text, path text, cwd text, title text,
     started text, updated text, branch text, n_msgs int, parent text,
-    native_summary text, first_prompt text, last_prompt text);
+    native_summary text, first_prompt text, last_prompt text, branches text);
 create table if not exists messages(session text, seq int, ts text, role text, text text);
 create table if not exists annotations(
     id text primary key, title text, summary text, tags text, by text, updated text);
@@ -73,7 +73,8 @@ class Session:
     path: str           # transcript file (or Cursor's state DB, or Devin's per-session cache DB)
     cwd: str | None = None
     title: str | None = None
-    branch: str | None = None
+    start_branch: str | None = None    # the checkout's branch when the conversation began
+    branches: list = field(default_factory=list)  # branches its own work landed on, in order (see note_branch)
     parent: str | None = None          # set for subagent sessions
     native_summary: str | None = None
     messages: list = field(default_factory=list)  # [(iso_ts, role, text)], role: user | assistant | tool
@@ -82,8 +83,29 @@ class Session:
         if text and text.strip():
             self.messages.append((iso(ts), role, text))
 
+    def note_start_branch(self, name) -> None:
+        self.start_branch = self.start_branch or _branch_name(name)
+
+    def note_branch(self, name) -> None:
+        """Record a branch this conversation's own work landed on (an edit, a commit, a push, a PR). Only call it
+        for the conversation's own actions: in a shared checkout the branch also changes when you or another
+        agent switch it, and those switches say nothing about this conversation."""
+        name = _branch_name(name)
+        if name and (not self.branches or self.branches[-1] != name):
+            self.branches.append(name)
+
+    @property
+    def branch(self) -> str | None:
+        """Where the conversation's work went: the branch of its last write, else the branch it started on."""
+        return self.branches[-1] if self.branches else self.start_branch
+
     def is_summarizer_run(self) -> bool:
         return any(role == "user" and text.startswith(SUMMARIZER_MARKER) for _, role, text in self.messages[:3])
+
+
+def _branch_name(name) -> str | None:
+    """A branch name, or None for nothing or a detached HEAD."""
+    return name.strip() if isinstance(name, str) and name.strip() and name.strip() != "HEAD" else None
 
 
 def save_session(db: sqlite3.Connection, s: Session) -> None:
@@ -99,11 +121,12 @@ def save_session(db: sqlite3.Connection, s: Session) -> None:
     first_prompt = (substantive or prompts or [None])[0]
     last_prompt = prompts[-1] if prompts else None
 
-    db.execute("insert into sessions values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+    branches = list(dict.fromkeys(([s.start_branch] if s.start_branch else []) + s.branches))  # each once, in order
+    db.execute("insert into sessions values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
         s.id, s.source, s.native_id, s.path, s.cwd, s.title,
         min(timestamps, default=None), max(timestamps, default=None),
         s.branch, len(s.messages), s.parent,
-        s.native_summary, _one_line(first_prompt), _one_line(last_prompt)))
+        s.native_summary, _one_line(first_prompt), _one_line(last_prompt), "\n".join(branches) or None))
     db.executemany("insert into messages values(?,?,?,?,?)",
                    [(s.id, seq, ts, role, text) for seq, (ts, role, text) in enumerate(s.messages)])
 
@@ -153,6 +176,7 @@ SESSION_FIELDS = [
     ("started", "s.started"),
     ("updated", "s.updated"),
     ("branch", "s.branch"),
+    ("branches", "s.branches"),
     ("n_msgs", "s.n_msgs"),
     ("parent", "s.parent"),
 ]
@@ -163,7 +187,14 @@ SESSION_FROM = "sessions s left join annotations a on a.id = s.id"
 
 def get_session(db: sqlite3.Connection, session_id: str) -> dict | None:
     row = db.execute(f"select {SESSION_SELECT} from {SESSION_FROM} where s.id=?", (session_id,)).fetchone()
-    return dict(zip(SESSION_KEYS, row)) if row else None
+    return session_dict(row) if row else None
+
+
+def session_dict(row, extra_keys: tuple = ()) -> dict:
+    """A sessions row (SESSION_SELECT, then extra_keys) as a dict; branches become a list."""
+    session = dict(zip(SESSION_KEYS + list(extra_keys), row))
+    session["branches"] = session["branches"].split("\n") if session["branches"] else []
+    return session
 
 
 def get_messages(db: sqlite3.Connection, session_id: str, include_tools: bool = True) -> list[tuple]:

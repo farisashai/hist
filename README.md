@@ -88,7 +88,7 @@ each other as typed, then **all words, any order**; each group newest first. Pre
 
 - **While typing**: `↑↓` select, `enter` opens the transcript at the first match, `tab` drops to the list,
   `esc` clears the search.
-- **In the list**: `/` text, `r` regex, `d` dir (`.` = cwd), `s`/`u` since/until (`3d`, `12h`, `2026-10-01`),
+- **In the list**: `/` text, `r` regex, `d` dir (`.` = cwd), `b` branch, `s`/`u` since/until (`3d`, `12h`, `2026-10-01`),
   `x` source, `t` include tool calls, `a` subagents, `c` clear, `R` re-index, `y` copy resume command,
   `p` copy transcript path, `q` quit.
 - **In a transcript**: rendered as Markdown with matches highlighted; `n`/`N` next/prev match, `g`/`G` top/bottom,
@@ -154,10 +154,15 @@ errors are `{"error", "hint", "code"}` on stdout; progress and notes always go t
 - Message-level filters (`-q`, `-e`, `--since`, `--until`, `--role`) must hold on the **same message**, so `--since 2d -q foo`
   finds old conversations where *foo* was said in the last two days.
 - `-d` matches the session's working directory or anything beneath it.
+- `-b` matches part of a branch the session worked on (case-insensitive). `branch` is where its work went: the branch
+  of its last edit, commit, push or PR, else the one it started on; `branches` lists every one, in order. Your own
+  or another agent's switches of a shared checkout don't count. Claude Code records the branch with every message;
+  Codex only at the start and now, so a Codex session moves to the current branch only if it switched branches
+  itself; Devin uses its PR and push branches; Cursor records none, so its sessions have no branch.
 - Default search covers user + assistant text; `--tools` adds tool calls/outputs (truncated to 2k chars).
 - Subagent sessions are hidden unless `--subagents`.
 - Each result has `title`, `summary` (`summary_source`: annotation > native > first_prompt), `first_prompt`,
-  `last_prompt`, `resume` (shell command to reopen it), and `path` (raw transcript).
+  `last_prompt`, `branch`/`branches`, `resume` (shell command to reopen it), and `path` (raw transcript).
 
 ## Merge-ready gate (task-completion hook)
 

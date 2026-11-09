@@ -16,7 +16,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from .sources import SOURCES
-from .store import SESSION_FROM, SESSION_KEYS, SESSION_SELECT
+from .store import SESSION_FROM, SESSION_SELECT, session_dict
 from .util import HistError, iso, like_escape
 
 ROLES = ("user", "assistant", "tool")
@@ -29,6 +29,7 @@ class Query:
     text: str | None = None        # words, all in one message, any order, case-insensitive
     regex: str | None = None       # Python regex (rg-compatible for common patterns)
     dir: str | None = None         # absolute path; matches that directory and everything below it
+    branch: str | None = None      # part of a branch name the session worked on, case-insensitive
     since: str | None = None       # UTC ISO, inclusive
     until: str | None = None       # UTC ISO, exclusive
     sources: list[str] = field(default_factory=list)
@@ -45,6 +46,7 @@ class Query:
             text=args.get("query") or None,
             regex=args.get("regex") or None,
             dir=normalize_dir(args.get("dir")),
+            branch=(args.get("branch") or "").strip() or None,
             since=parse_when(args.get("since"), flag="--since"),
             until=parse_when(args.get("until"), flag="--until", end_of_day=True),
             sources=parse_sources(args.get("source")),
@@ -117,6 +119,9 @@ class Query:
         if self.dir:
             conditions.append("(s.cwd = ? or s.cwd like ? escape '\\')")
             params += [self.dir, like_escape(self.dir) + "/%"]
+        if self.branch:
+            conditions.append("s.branches like ? escape '\\'")
+            params.append(f"%{like_escape(self.branch)}%")
         if self.sources:
             conditions.append(f"s.source in ({placeholders(self.sources)})")
             params += self.sources
@@ -223,7 +228,7 @@ def search(db: sqlite3.Connection, q: Query) -> list[dict]:
 
     results = []
     for row in rows:
-        session = dict(zip(SESSION_KEYS + ["hits", "last_hit", "exact"], row))
+        session = session_dict(row, ("hits", "last_hit", "exact"))
         session["exact"] = bool(session["exact"])
         session["resume"] = resume_command(session)
         if q.filters_messages:

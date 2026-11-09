@@ -19,7 +19,7 @@ from functools import partial
 
 from ..store import Session
 from ..util import INJECTED, cap
-from . import TEXT_LIMIT, TOOL_LIMIT, Paths, index_files
+from . import GIT_SWITCH, TEXT_LIMIT, TOOL_LIMIT, Paths, index_files
 
 THREAD_ID = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 TOOL_CALLS = ("function_call", "custom_tool_call", "local_shell_call")
@@ -35,7 +35,7 @@ def index(db, paths: Paths, full: bool) -> int:
 
 
 def load_thread_info(codex_home: str) -> dict[str, tuple[str | None, str | None]]:
-    """{thread id: (title, git branch)} from Codex's state DB, falling back to session_index.jsonl."""
+    """{thread id: (title, current git branch)} from Codex's state DB, falling back to session_index.jsonl."""
     threads = {}
     try:
         state = sqlite3.connect(f"file:{codex_home}/state_5.sqlite?immutable=1", uri=True)
@@ -76,7 +76,10 @@ def parse(path: str, threads: dict) -> Session:
 
     title, branch = threads.get(session.native_id, (None, None))
     session.title = title or session.title
-    session.branch = branch or session.branch
+    # Codex records the branch a thread started on and the checkout's branch now. The latter also moves when
+    # you or another agent switch the checkout, so it only counts when this conversation switched branches itself.
+    if any(role == "tool" and GIT_SWITCH.search(text) for _, role, text in session.messages):
+        session.note_branch(branch)
     return session
 
 
@@ -84,6 +87,7 @@ def read_session_meta(session: Session, meta: dict) -> None:
     session.cwd = session.cwd or meta.get("cwd")
     session.native_id = meta.get("id") or session.native_id
     session.parent = meta.get("parent_thread_id")
+    session.note_start_branch((meta.get("git") or {}).get("branch"))
     if meta.get("agent_nickname"):
         session.title = session.title or f"[subagent {meta['agent_nickname']}]"
 

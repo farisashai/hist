@@ -113,7 +113,6 @@ def parse(path: str, key: str) -> tuple[Session, list[str]]:
     repos = [r.get("name") or r.get("id") for r in extra.get("cognition.ai/sessionRepos") or [] if isinstance(r, dict)]
     prs = [pr for pr in extra.get("cognition.ai/sessionPRs") or [] if isinstance(pr, dict)]
     session.native_summary = pr_summary(prs)
-    session.branch = next((pr.get("headRef") for pr in prs if pr.get("headRef")), None)
 
     # Local (CLI) sessions carry no per-message times: carry the last one seen forward from the file's mtime.
     current_time = db_stat(path)[0]
@@ -126,9 +125,21 @@ def parse(path: str, key: str) -> tuple[Session, list[str]]:
             session.add(current_time, role, text)
         if kind == "tool_call" and not session.cwd:
             session.cwd = local_cwd(record)
-        if kind == "agent_message" and not session.branch:
-            session.branch = block_meta(record).get("cognition.ai/branchName")
+        session.note_branch(record_branch(kind, record))
+    for pr in prs:  # the PRs it ended up with, in case their creation is outside the cached history
+        session.note_branch(pr.get("headRef"))
     return session, [r for r in repos if r]
+
+
+def record_branch(kind: str, record: dict) -> str | None:
+    """The branch a PR was opened or taken over on, or pushed to."""
+    if kind == "agent_message":
+        return block_meta(record).get("cognition.ai/branchName")
+    if kind == "tool_call":
+        meta = (record.get("content") or {}).get("_meta") or {}
+        if meta.get("cognition.ai/eventType") == "git_push":
+            return meta.get("cognition.ai/branch")
+    return None
 
 
 def session_id(url: str | None, key: str, path: str) -> str:
