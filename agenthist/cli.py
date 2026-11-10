@@ -74,6 +74,31 @@ def cmd_show(db, args: dict) -> None:
         print()
 
 
+def cmd_export(db, args: dict) -> None:
+    session_id = store.resolve_session(db, args["session"])
+    session = store.get_session(db, session_id)
+    messages = store.get_messages(db, session_id, include_tools=args["tools"])
+    lines = [f"# {session['title'] or 'Conversation'}", "",
+             f"Source: {session['source']}  ", f"Session: {session['id']}  ",
+             f"Working directory: {session['cwd'] or '(unknown)'}", "",
+             "This is an exported conversation for context in a new session. "
+             "Messages reflect the local hist index and may be truncated.", ""]
+    if session.get("summary"):
+        lines.extend(["## Summary", "", session["summary"], ""])
+    lines.extend(["## Conversation", ""])
+    for seq, ts, role, text in messages:
+        lines.extend([f"### {role.title()} · {ts or 'unknown time'} · {seq}", "", text, ""])
+    output = "\n".join(lines)
+    if args["output"]:
+        try:
+            with open(os.path.expanduser(args["output"]), "x", encoding="utf-8") as f:
+                f.write(output)
+        except OSError as e:
+            raise HistError(f"couldn't write export: {e}")
+    else:
+        print(output, end="")
+
+
 def filter_messages(messages: list[tuple], args: dict) -> list[tuple]:
     """Apply show's --grep, --range, --tail and --max-chars, in that order."""
     if args.get("grep"):
@@ -247,6 +272,7 @@ INDEXLESS_COMMANDS = {"ready": cmd_ready, "hook": cmd_hook, "install-hooks": cmd
 COMMANDS = {
     "search": cmd_search,
     "show": cmd_show,
+    "export": cmd_export,
     "dirs": cmd_dirs,
     "sources": cmd_sources,
     "annotate": cmd_annotate,
@@ -304,6 +330,13 @@ def build_parser() -> tuple[Parser, argparse._SubParsersAction]:
     show.add_argument("--no-tools", action="store_true", help="omit tool calls/outputs")
     show.add_argument("--json", action="store_true")
     show.add_argument("--no-index", action="store_true")
+
+    export = command("export", "export a session as Markdown for a fresh conversation", [
+        "hist export <id> -o conversation.md", "hist export <id> --tools > conversation.md"])
+    export.add_argument("session", help="id, native id, or unique prefix/substring")
+    export.add_argument("-o", "--output", metavar="FILE", help="write a new file instead of stdout")
+    export.add_argument("--tools", action="store_true", help="include indexed tool calls and outputs")
+    export.add_argument("--no-index", action="store_true", help="skip the incremental refresh")
 
     dirs = command("dirs", "list working directories that have sessions, most recently active first", [
         "hist dirs --json", "hist dirs -s cursor --since 7d"])

@@ -137,6 +137,7 @@ before"* and it can discover the commands with `hist help`. The output is design
 hist search -q "rate limit" -d ~/src/app --since 7d --json   # JSONL, one session per line, matching messages in hits_preview
 hist search -e 'Shadow (AI|skills)' --until 2026-09-15 -s codex,cursor --json
 hist show <id-or-prefix> --no-tools --json                     # full transcript (+ --range 40:80, --tail N, --max-chars N)
+hist export <id-or-prefix> -o conversation.md                 # portable context for a fresh session (+ --tools)
 hist show <id> --grep 'migration'                              # only matching messages
 hist annotate <id> --title "..." --summary "..." --tags a,b --by my-agent   # persists across re-index
 hist summarize                                                 # LLM-fill missing summaries from the past week (on demand)
