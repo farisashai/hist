@@ -29,7 +29,7 @@ class Filter:
 
 
 FILTERS = [
-    Filter("query", "Text", "/", "live · ↑↓ select · enter open · tab list · esc clear"),
+    Filter("query", "Text", "/", "live · enter apply · esc clear"),
     Filter("regex", "Regex", "r", "python/rg regex"),
     Filter("dir", "Dir", "d", "path; . = cwd"),
     Filter("branch", "Branch", "b", "part of a branch name"),
@@ -44,8 +44,9 @@ SOURCE_WIDTH = max(len(name) for name in SOURCES)
 RESULT_LIMIT = 300
 DEBOUNCE_MS = 90
 
-HELP = ("/ live search · R reindex · ↑↓ move · enter open · r regex · d dir · b branch · s since · u until · x source · "
-        "t tools · a subagents · c clear · y copy resume · p copy path · q quit")
+HELP = "←→ choose action · ↑↓ choose conversation · enter activate · / search · q quit"
+
+CONTROLS = ["Open"] + [f.label for f in FILTERS] + ["Tools", "Subagents", "Clear", "Export", "Reindex"]
 
 # color pairs
 CYAN, YELLOW, GREEN, MAGENTA, RED = 1, 2, 3, 4, 5
@@ -64,6 +65,7 @@ class TUI:
         self.results: list[dict] = []
         self.selected = 0
         self.scroll = 0
+        self.control = 0
         self.status = ""
         self.error = ""
         self.launch: tuple[list[str], str | None] | None = None  # set to quit and resume a session in its client
@@ -114,7 +116,6 @@ class TUI:
         setup_colors()
         curses.curs_set(0)
         self.refresh()
-        self.edit_filter(FILTERS[0])  # start in the search box, like fzf
 
         while True:
             if self.launch:
@@ -135,8 +136,14 @@ class TUI:
                 self.move_selection(10)
             elif key == curses.KEY_PPAGE:
                 self.move_selection(-10)
-            elif key in ("\n", curses.KEY_ENTER, "l", curses.KEY_RIGHT) and session:
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                self.control = (self.control + (1 if key == curses.KEY_RIGHT else -1)) % len(CONTROLS)
+            elif key in ("\n", curses.KEY_ENTER):
+                self.activate_control()
+            elif key == "l" and session:
                 self.open(session)
+            elif key == "e" and session:
+                self.export(session)
             elif key == "t":
                 self.include_tools = not self.include_tools
                 self.refresh()
@@ -155,6 +162,53 @@ class TUI:
                 self.copy(session["resume"] or session["path"])
             elif key == "p" and session:
                 self.copy(session["path"])
+
+    def activate_control(self) -> None:
+        action = CONTROLS[self.control]
+        session = self.selected_session()
+        if action == "Open" and session:
+            self.open(session)
+        elif action in {f.label for f in FILTERS}:
+            self.edit_filter(next(f for f in FILTERS if f.label == action))
+        elif action == "Tools":
+            self.include_tools = not self.include_tools
+            self.refresh(keep_selection=True)
+        elif action == "Subagents":
+            self.include_subagents = not self.include_subagents
+            self.refresh(keep_selection=True)
+        elif action == "Clear":
+            self.values = {f.key: "" for f in FILTERS}
+            self.refresh(keep_selection=True)
+        elif action == "Export" and session:
+            self.export(session)
+        elif action == "Reindex":
+            self.status = "re-indexing…"
+            self.draw()
+            index_all(self.db, quiet=True)
+            self.refresh(keep_selection=True)
+
+    def export(self, session: dict) -> None:
+        """Prompt for a new Markdown file and export the selected conversation."""
+        editor = LineEditor("conversation.md")
+        curses.curs_set(1)
+        while True:
+            self.draw(show_help=False)
+            self.draw_input("Export to new file (enter save · esc cancel): ", editor)
+            key = self.screen.get_wch()
+            if key == "\x1b":
+                break
+            if key in ("\n", curses.KEY_ENTER):
+                if editor.text.strip():
+                    try:
+                        from .cli import cmd_export
+                        cmd_export(self.db, {"session": session["id"], "tools": self.include_tools,
+                                             "output": editor.text.strip()})
+                        self.status = f"exported: {editor.text.strip()}"
+                    except Exception as e:
+                        self.status = str(e)
+                break
+            editor.handle(key)
+        curses.curs_set(0)
 
     def open(self, session: dict) -> None:
         query = self.current_query()
@@ -192,7 +246,7 @@ class TUI:
             dirty = True
 
             if key in ("\n", curses.KEY_ENTER):
-                open_after = live  # the search box opens the selection, typed into or not; other filters just apply
+                open_after = False  # apply the filter and return to the action bar
                 break
             if key == "\t":
                 open_after = False
@@ -254,19 +308,27 @@ class TUI:
         self.screen.refresh()
 
     def draw_filter_bar(self, width: int) -> None:
+        labels = ["Open"]
+        labels += [f"{f.label}[{f.hotkey}]:{self.values[f.key] or '·'}" for f in FILTERS]
+        labels += [f"Tools[t]:{'on' if self.include_tools else 'off'}",
+                   f"Subagents[a]:{'on' if self.include_subagents else 'off'}", "Clear[c]", "Export[e]", "Reindex[R]"]
+        start = self.control
+        used = len(labels[start])
+        while start > 0 and used + len(labels[start - 1]) + 2 < width - 1:
+            start -= 1
+            used += len(labels[start]) + 2
         x = 0
-        for f in FILTERS:
-            label = f"{f.label}[{f.hotkey}]: "
-            value = self.values[f.key]
-            self.put(0, x, label, curses.color_pair(CYAN))
-            self.put(0, x + len(label), value or "·", curses.A_BOLD if value else curses.A_DIM)
-            x += len(label) + len(value or "·") + 2
-
-        toggles = (f"tools[t]:{'on' if self.include_tools else 'off'}  "
-                   f"subagents[a]:{'on' if self.include_subagents else 'off'}  clear[c]")
-        self.put(1, 0, toggles, curses.A_DIM)
+        for i in range(start, len(labels)):
+            if x >= width - 1:
+                break
+            attr = curses.A_REVERSE | curses.A_BOLD if i == self.control else curses.color_pair(CYAN)
+            self.put(0, x, labels[i], attr)
+            x += len(labels[i]) + 2
         message = self.error or self.status
-        self.put(1, max(0, width - len(message) - 2), message, curses.color_pair(RED) if self.error else curses.A_DIM)
+        self.put(1, 0, "←→ action · ↑↓ conversation · enter select · / search · e export · q quit", curses.A_DIM)
+        if len(message) + 3 < width:
+            self.put(1, max(0, width - len(message) - 2), message,
+                     curses.color_pair(RED) if self.error else curses.A_DIM)
 
     def display_rows(self) -> list[tuple[str, int | str]]:
         """The result list as drawn: ("session", index into results), with ("header", text) rows above the exact
