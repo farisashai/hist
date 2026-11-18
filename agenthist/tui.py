@@ -176,16 +176,20 @@ class TUI:
 
         curses.curs_set(1)
         self.screen.timeout(DEBOUNCE_MS)
+        dirty = True
         while True:
-            self.draw(show_help=False)
-            self.draw_input(f"{f.label} ({f.hint}): ", editor)
+            if dirty:  # redrawing on idle ticks would repaint the screen ~11 times a second for nothing
+                self.draw(input=(f"{f.label} ({f.hint}): ", editor))
+                dirty = False
             try:
                 key = self.screen.get_wch()
             except curses.error:  # no key within the debounce window
                 if pending and live:
                     self.set_filter(f.key, editor.text)
                     pending = False
+                    dirty = True
                 continue
+            dirty = True
 
             if key in ("\n", curses.KEY_ENTER):
                 open_after = live  # the search box opens the selection, typed into or not; other filters just apply
@@ -232,7 +236,9 @@ class TUI:
             except curses.error:
                 pass
 
-    def draw(self, show_help: bool = True) -> None:
+    def draw(self, input: tuple[str, "LineEditor"] | None = None) -> None:
+        """Draw the whole screen, with the input line (prompt, editor) in place of the key help if given.
+        Everything goes out in one refresh, so the input line and cursor never flash blank."""
         self.screen.erase()
         height, width = self.screen.getmaxyx()
         list_height = max(3, (height - 4) // 2)
@@ -241,7 +247,9 @@ class TUI:
         self.draw_results(top=2, height=list_height, width=width)
         self.put(2 + list_height, 0, "─" * (width - 1), curses.A_DIM)
         self.draw_preview(top=3 + list_height, bottom=height - 1, width=width)
-        if show_help:
+        if input:
+            self.draw_input(*input)
+        else:
             self.put(height - 1, 0, HELP, curses.A_DIM)
         self.screen.refresh()
 
