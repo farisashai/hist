@@ -101,7 +101,7 @@ each other as typed, then **all words, any order**; each group newest first. Pre
   | `codex` | `codex resume <id>` |
   | `cursor` | `cursor-agent --resume <id>`, or opens the workspace in Cursor if the CLI agent isn't installed |
   | `devin` | `open devin://session/<id>`, which opens the session in the Devin desktop app |
-  | `claude-desktop` | not resumable from a terminal |
+  | `claude-desktop` | `open claude://claude.ai/cowork/<desktop-session-id>`, which opens the Cowork session in Claude Desktop |
 
 ## What it reads
 

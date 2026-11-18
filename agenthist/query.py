@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import datetime as dt
 import difflib
+import glob
+import json
 import os
 import re
 import shlex
@@ -269,6 +271,22 @@ def resume_argv(session: dict) -> tuple[list[str], str | None] | None:
         cwd = None
     if source == "claude":
         return ["claude", "--resume", native_id], cwd
+    if source == "claude-desktop":
+        # The transcript ID is the CLI ID; the desktop route needs the local session ID.
+        path = session.get("path") or ""
+        marker = f"{os.sep}.claude{os.sep}projects{os.sep}"
+        if marker in path:
+            session_dir = path.split(marker, 1)[0]
+            for metadata_path in glob.glob(os.path.join(os.path.dirname(session_dir), "local_*.json")):
+                try:
+                    with open(metadata_path) as metadata_file:
+                        metadata = json.load(metadata_file)
+                    desktop_id = metadata.get("sessionId", "")
+                    if (metadata.get("cliSessionId") == native_id
+                            and re.fullmatch(r"local_[0-9a-fA-F-]{36}", desktop_id)):
+                        return ["open", f"claude://claude.ai/cowork/{desktop_id}"], None
+                except (OSError, ValueError, TypeError):
+                    continue
     if source == "codex":
         return ["codex", "resume", native_id], cwd
     if source == "cursor":
