@@ -192,8 +192,7 @@ class TUI:
         editor = LineEditor("conversation.md")
         curses.curs_set(1)
         while True:
-            self.draw(show_help=False)
-            self.draw_input("Export to new file (enter save · esc cancel): ", editor)
+            self.draw(input=("Export to new file (enter save · esc cancel): ", editor))
             key = self.screen.get_wch()
             if key == "\x1b":
                 break
